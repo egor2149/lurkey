@@ -3,6 +3,7 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = Players.LocalPlayer
 local PLACE_ID = 142823291
@@ -12,7 +13,7 @@ local CFG = {
 	diveDepth = 25, -- studs under the floor in dive mode
 	touchTime = 1, -- seconds to wait on a coin for the server to register it
 	retryAfter = 20, -- seconds before a missed coin is tried again
-	missLimit = 4, -- consecutive misses treated as a full bag when the bag HUD can't be read
+	missLimit = 4, -- consecutive misses treated as a full bag when bag counts are unavailable
 	mapMargin = 60, -- studs outside the map bounds that still count as "on the map"
 }
 
@@ -497,30 +498,107 @@ local function clearTraps(map)
 	end
 end
 
--- Reads the bag HUD: known, every bag full, any bag full.
-local function bagUI()
-	local ok, known, all, any = pcall(function()
-		local container = LocalPlayer.PlayerGui.MainGUI.Game.CoinBags.Container
-		local known, all, any = false, true, false
-		for _, bag in ipairs(container:GetChildren()) do
-			local icon = bag:FindFirstChild("FullBagIcon")
-			if icon and bag:IsA("GuiObject") and bag.Visible then
-				known = true
-				if icon.Visible then any = true else all = false end
+---------------------------------------------------------------------------
+-- Bag: exact counts from the server's CoinCollected event, the HUD as fallback.
+---------------------------------------------------------------------------
+local Bag = { counts = {}, active = nil, events = 0 }
+
+function Bag.reset()
+	table.clear(Bag.counts)
+	Bag.active = nil
+end
+
+function Bag.onCollected(bagName, count, max)
+	if type(bagName) ~= "string" or type(count) ~= "number" then return end
+	Bag.counts[bagName] = { count = count, max = type(max) == "number" and max or nil }
+	Bag.events += 1
+end
+
+-- Fired at the start of the coin phase with the round's bag slots (Coin, Candy, ...).
+function Bag.onStarted(slots)
+	table.clear(Bag.counts)
+	if type(slots) == "table" then
+		local active = {}
+		for slot in pairs(slots) do active[#active + 1] = tostring(slot) end
+		Bag.active = #active > 0 and active or nil
+	end
+end
+
+local function bagContainer()
+	local main = LocalPlayer.PlayerGui:FindFirstChild("MainGUI")
+	local bags = main and main:FindFirstChild("CoinBags", true)
+	return bags and bags:FindFirstChild("Container")
+end
+
+local function hudSlot(container, name)
+	local slot = container and container:FindFirstChild(name)
+	if not slot or not slot:IsA("GuiObject") or not slot.Visible then return nil end -- hidden outside the coin phase
+	local currency = slot:FindFirstChild("CurrencyFrame")
+	local icon = currency and currency:FindFirstChild("Icon")
+	local coins = icon and icon:FindFirstChild("Coins")
+	local fullIcon = slot:FindFirstChild("FullBagIcon")
+	local fullLabel = slot:FindFirstChild("Full")
+	return {
+		count = coins and tonumber(string.match(coins.Text, "%d+")) or nil,
+		full = (fullIcon and fullIcon.Visible) or (fullLabel and fullLabel.Visible) or false,
+		bagName = slot:GetAttribute("BagName"),
+	}
+end
+
+-- known, every bag full, any bag full, exact (all from server events), display text
+function Bag.status()
+	local ok, known, all, any, exact, text = pcall(function()
+		local container = bagContainer()
+		local names = Bag.active
+		if not names then
+			names = {}
+			for _, child in ipairs(container and container:GetChildren() or {}) do
+				if child:IsA("GuiObject") and child.Visible then names[#names + 1] = child.Name end
 			end
 		end
-		return known, all, any
+		local known, all, any, exact, matched, parts = false, true, false, true, false, {}
+		local function add(count, max, full, fromEvent)
+			known = true
+			if full then any = true else all = false end
+			if not fromEvent then exact = false end
+			parts[#parts + 1] = max and string.format("%d/%d", count, max) or tostring(count or (full and "полон" or "?"))
+		end
+		for _, name in ipairs(names) do
+			local hud = hudSlot(container, name)
+			local ev = (hud and hud.bagName and Bag.counts[hud.bagName]) or Bag.counts[name]
+			if ev then
+				matched = true
+				add(ev.count, ev.max, ev.max ~= nil and ev.count >= ev.max, ev.max ~= nil)
+			elseif hud then
+				add(hud.count, nil, hud.full, false)
+			end
+		end
+		if not matched and next(Bag.counts) then
+			-- events we can't tie to a HUD slot are still the most accurate source
+			known, all, any, exact, parts = false, true, false, true, {}
+			for _, ev in pairs(Bag.counts) do add(ev.count, ev.max, ev.max ~= nil and ev.count >= ev.max, ev.max ~= nil) end
+		end
+		return known, all, any, exact, table.concat(parts, " · ")
 	end)
-	if not ok or not known then return false, false, false end
-	return true, all, any
+	if not ok or not known then return false, false, false, false, nil end
+	return true, all, any, exact, text
 end
 
 local function bagIsFull()
-	local known, all, any = bagUI()
+	local known, all, any, exact = Bag.status()
 	if known and all then return true end
+	if known and exact then return false end -- server counts say there's room; misses are just bad spots
 	if known and any then return state.misses >= 2 end
 	-- the HUD may be missing or misread, so repeated misses still end the round
 	return state.misses >= (known and CFG.missLimit * 2 or CFG.missLimit)
+end
+
+-- Once CoinCollected has been seen, a vanished coin only counts if the event followed.
+local function confirmed(eventsBefore, fallback)
+	if Bag.events == 0 then return fallback end
+	local deadline = os.clock() + 0.5
+	while Bag.events == eventsBefore and os.clock() < deadline do RunService.Heartbeat:Wait() end
+	return Bag.events > eventsBefore
 end
 
 ---------------------------------------------------------------------------
@@ -576,13 +654,14 @@ local NUDGES = {
 }
 
 local function collect(coin, pos, floorY)
+	local events = Bag.events
 	local function lost()
 		return roundOver() or not coinAlive(coin)
 	end
 	local function settle()
 		if coinAlive(coin) then return "aborted" end
-		-- it vanished as we reached it, so it was ours; otherwise someone else took it
-		return (ctrl.pos - pos).Magnitude <= 6 and "collected" or "gone"
+		-- without the event: vanishing as we reached it means it was ours
+		return confirmed(events, (ctrl.pos - pos).Magnitude <= 6) and "collected" or "gone"
 	end
 
 	if state.mode == "dive" then
@@ -593,7 +672,7 @@ local function collect(coin, pos, floorY)
 	touch(coin)
 	local start, nudge = os.clock(), 0
 	while ctrl.engaged and os.clock() - start < CFG.touchTime do
-		if not coinAlive(coin) then return "collected" end
+		if not coinAlive(coin) then return confirmed(events, true) and "collected" or "gone" end
 		if roundOver() or not (state.running and stillOwner()) then return "aborted" end
 		local due = math.floor((os.clock() - start) / 0.2)
 		if due > nudge and due <= #NUDGES then
@@ -602,7 +681,7 @@ local function collect(coin, pos, floorY)
 		end
 		RunService.Heartbeat:Wait()
 	end
-	if not coinAlive(coin) then return "collected" end
+	if not coinAlive(coin) then return confirmed(events, true) and "collected" or "gone" end
 	return ctrl.engaged and "missed" or "aborted"
 end
 
@@ -687,6 +766,7 @@ local function endRound()
 	end
 	state.map, state.pivot, state.mem = nil, nil, nil
 	state.roundDone = nil
+	Bag.reset()
 	state.misses = 0
 end
 
@@ -770,7 +850,7 @@ local function farmStep()
 	elseif result == "missed" then
 		retryAt[coin] = os.clock() + CFG.retryAfter
 		state.misses += 1
-		local known, _, anyFull = bagUI()
+		local known, _, anyFull = Bag.status()
 		if known and not anyFull then Memory.result(state.mem, toLocal(pos), false) end
 	end
 	return 0
@@ -831,7 +911,8 @@ local memoryLabel = section:Label({ Text = "Память: —" })
 local function updateUI()
 	local text = PHASE_TEXT[state.phase] or state.phase
 	if state.phase == "error" and state.lastError then text = text .. ": " .. state.lastError end
-	statusLabel:SetText(string.format("Статус: %s · за раунд %d · всего %d", text, state.roundCoins, state.totalCoins))
+	local _, _, _, _, bag = Bag.status()
+	statusLabel:SetText(string.format("Статус: %s · мешок %s · всего %d", text, bag or tostring(state.roundCoins), state.totalCoins))
 	local m = state.mem
 	if m and state.map then
 		memoryLabel:SetText(string.format("Память: %s — %d раундов, ~%d монет за раунд",
@@ -851,6 +932,18 @@ do
 end
 
 for _, conn in ipairs(connections) do giveToWindow(conn) end
+giveToWindow(task.spawn(function()
+	local remotes = ReplicatedStorage:WaitForChild("Remotes", 30)
+	local gameplay = remotes and remotes:WaitForChild("Gameplay", 10)
+	if not gameplay then
+		warn("[MM2] Remotes.Gameplay not found; bag is read from the HUD")
+		return
+	end
+	local collected = gameplay:WaitForChild("CoinCollected", 10)
+	if collected then giveToWindow(collected.OnClientEvent:Connect(Bag.onCollected)) end
+	local started = gameplay:WaitForChild("CoinsStarted", 10)
+	if started then giveToWindow(started.OnClientEvent:Connect(Bag.onStarted)) end
+end))
 giveToWindow(task.spawn(farmLoop))
 giveToWindow(task.spawn(function()
 	while stillOwner() do
