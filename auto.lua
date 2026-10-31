@@ -1,13 +1,20 @@
+-- MM2 coin auto-farm: one switch and a mode selector.
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
 local HttpService = game:GetService("HttpService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = Players.LocalPlayer
 local PLACE_ID = 142823291
-local rng = Random.new()
+
+local CFG = {
+	speed = 23, -- studs/s
+	diveDepth = 25, -- studs under the floor in dive mode
+	touchTime = 1, -- seconds to wait on a coin for the server to register it
+	retryAfter = 20, -- seconds before a missed coin is tried again
+	missLimit = 4, -- consecutive misses treated as a full bag when the bag HUD can't be read
+	mapMargin = 60, -- studs outside the map bounds that still count as "on the map"
+}
 
 local UI_URL = "https://raw.githubusercontent.com/Project-Ptolemy/ProjectUAI/main/dist/uai-ui.lua"
 local UI
@@ -25,26 +32,13 @@ do
 	UI = result
 end
 
-local CFG = {
-	speed = 23,
-	diveDepth = 25,
-	touchHold = 0.06,
-	failLimit = 3,
-	blacklistTime = 25,
-	emptyWait = 3,
-	endBuffer = 3,
-	bagCap = 0, -- 0 = use the game's bag signal or the learned cap
-	maxMapDist = 1200,
-	collectRadius = 9,
-	holdMethod = "anchor", -- "anchor" | "hover"; memory may override
-	avoidMurderer = true,
-	dangerRadius = 22,
-	lookahead = 0.5,
-	learning = true,
-	autosave = 20,
-	exploreRate = 0.1,
-	signalWait = 0.3,
-}
+-- Creating the window destroys a previous instance's window (same Id), which
+-- lets that instance hand the character back before we claim ownership.
+local window = UI:CreateWindow({
+	Id = "mm2-collect",
+	Title = "MM2 Collect",
+	Subtitle = "автофарм монет",
+})
 
 local ENV
 do
@@ -55,1365 +49,827 @@ local TOKEN = {}
 if ENV then ENV.MM2_TOKEN = TOKEN end
 
 local function stillOwner()
-	if not ENV then return true end
-	return ENV.MM2_TOKEN == TOKEN
+	return not ENV or ENV.MM2_TOKEN == TOKEN
 end
 
-local conns = {}
-local function track(conn)
-	conns[#conns + 1] = conn
-	return conn
-end
-local function disconnectAll()
-	for _, c in ipairs(conns) do
-		pcall(function() c:Disconnect() end)
-	end
-	table.clear(conns)
-end
-
-local window = nil
-
-local state = {
-	running = false,
-	phase = "waiting",
-	mode = "normal", -- user choice: normal | dive | auto
-	activeMode = "normal", -- mode actually used this round
-	holdMethod = CFG.holdMethod,
-	inRound = false,
-	roundOver = false,
-	mapEmpty = false,
-	bagFull = false,
-	parked = false,
-	roundCollected = 0,
-	totalCollected = 0,
-	failures = 0,
-	emptySince = nil,
-	lastSafe = nil,
-	lastPos = nil,
-	coinsOnMap = 0,
-	roundSeconds = nil,
-	lastError = nil,
-	thread = nil,
-	frozen = false,
-	noclip = false,
-	tweening = false,
-	holdCFrame = nil,
-	lastPhasePrinted = nil,
-	roundContainer = nil,
-	endedContainer = nil,
-	roundMap = nil,
-	roundMapName = nil,
-	roundStart = 0,
-	roundRecorded = true,
-	methodSwitched = false,
-	deathHandled = false,
-	sessionStart = os.clock(),
-	-- game signals (optional, hooked if the remotes exist)
-	coinRemoteHooked = false,
-	coinSignalSeen = false,
-	lastCoinSignal = nil,
-	bagCount = nil,
-	bagMax = nil,
-	roundStartSignal = false,
-	roundEndSignal = false,
-}
-
-local blacklist = setmetatable({}, { __mode = "k" })
-local partCollide = setmetatable({}, { __mode = "k" })
-local seenCoins = setmetatable({}, { __mode = "k" })
-local coinGround = setmetatable({}, { __mode = "k" })
-
-local PHASE_TEXT = {
-	waiting = "ждём раунд",
-	farming = "сбор монет",
-	bagfull = "мешок полон — до конца раунда",
-	round_end = "раунд закончился — ждём следующий",
-	no_coins = "монет на карте нет",
-	threat = "убийца рядом — ждём",
-	dead = "персонаж мёртв",
-	wrong_game = "не та игра",
-	stopped = "остановлено",
-	error = "ошибка",
-}
-
-local function setPhase(phase)
-	state.phase = phase
-	if state.lastPhasePrinted ~= phase then
-		state.lastPhasePrinted = phase
-		print("[MM2] " .. phase .. " | " .. (PHASE_TEXT[phase] or ""))
+local function giveToWindow(resource)
+	if type(window.Give) == "function" then
+		pcall(function() window:Give(resource) end)
 	end
 end
 
 ---------------------------------------------------------------------------
--- Memory: persistent per-map knowledge (spawn hotspots, ground heights,
--- per-spot reliability, death zones, mode/hold-method performance, bag cap).
+-- Memory: what the farm learns per map, saved between sessions when the
+-- executor has writefile. Positions are stored relative to the map pivot.
 ---------------------------------------------------------------------------
 local Memory = {}
 do
-	local VERSION = 1
-	local CELL = 4
-	local DANGER_CELL = 16
-	local MAX_CELLS = 800
-	local MAX_GROUND = 2000
-	local MAX_MAPS = 60
-	local MIN_MODE_TIME = 45
-	local MIN_HOLD_SAMPLES = 20
+	local FILE = "mm2_collect_memory.json"
+	local SPOT, ZONE = 6, 16
+	local MAX_SPOTS, MAX_MAPS = 300, 30
+	local canSave = type(readfile) == "function" and type(writefile) == "function"
+	local data = { maps = {}, rounds = 0, coins = 0 }
+	local dirty, lastSave = false, 0
 
-	local canFs = type(readfile) == "function" and type(writefile) == "function"
-	local hasFolders = type(isfolder) == "function" and type(makefolder) == "function"
-	local DIR = "mm2_collect"
-	local FILE = hasFolders and (DIR .. "/memory.json") or "mm2_collect_memory.json"
+	Memory.persistent = canSave
 
-	local data
-	local dirty = false
-	local lastSave = 0
-
-	local function fresh()
-		return {
-			version = VERSION,
-			global = { sessions = 0, coins = 0, bagCap = nil, hold = {} },
-			maps = {},
-		}
+	local function key(p, size)
+		return string.format("%d,%d,%d", math.floor(p.X / size), math.floor(p.Y / size), math.floor(p.Z / size))
 	end
 
-	local function key3(pos)
-		return string.format("%d:%d:%d", math.floor(pos.X / CELL), math.floor(pos.Y / CELL), math.floor(pos.Z / CELL))
-	end
-
-	local function key2(pos)
-		return string.format("%d:%d", math.floor(pos.X / DANGER_CELL), math.floor(pos.Z / DANGER_CELL))
-	end
-
-	local function center3(key)
-		local x, y, z = key:match("^(-?%d+):(-?%d+):(-?%d+)$")
+	local function center(k)
+		local x, y, z = string.match(k, "^(-?%d+),(-?%d+),(-?%d+)$")
 		if not x then return nil end
-		return Vector3.new((tonumber(x) + 0.5) * CELL, (tonumber(y) + 0.5) * CELL, (tonumber(z) + 0.5) * CELL)
+		return Vector3.new((tonumber(x) + 0.5) * SPOT, (tonumber(y) + 0.5) * SPOT, (tonumber(z) + 0.5) * SPOT)
 	end
 
-	local function ema(old, value, alpha)
-		if old == nil then return value end
-		return old + (value - old) * alpha
-	end
-
-	local function trimTable(t, limit, score)
-		local keys = {}
-		for k in pairs(t) do keys[#keys + 1] = k end
-		if #keys <= limit then return end
-		if score then
-			table.sort(keys, function(a, b) return score(t[a]) > score(t[b]) end)
-		end
-		for i = limit + 1, #keys do t[keys[i]] = nil end
-	end
-
-	local function normalize(m)
-		m.rounds = m.rounds or 0
-		m.deaths = m.deaths or 0
-		m.cells = m.cells or {}
-		m.ground = m.ground or {}
-		m.danger = m.danger or {}
-		m.modes = m.modes or {}
-		for _, mode in ipairs({ "normal", "dive" }) do
-			local s = m.modes[mode] or {}
-			s.coins, s.time, s.deaths = s.coins or 0, s.time or 0, s.deaths or 0
-			m.modes[mode] = s
-		end
-		return m
-	end
-
-	function Memory.persistent()
-		return canFs
-	end
-
-	function Memory.load()
-		data = fresh()
-		if canFs then
-			local raw
-			pcall(function()
-				if type(isfile) ~= "function" or isfile(FILE) then raw = readfile(FILE) end
-			end)
-			if type(raw) == "string" and raw ~= "" then
-				local ok, decoded = pcall(function() return HttpService:JSONDecode(raw) end)
-				if ok and type(decoded) == "table" and decoded.version == VERSION and type(decoded.maps) == "table" then
-					data = decoded
-					data.global = type(data.global) == "table" and data.global or fresh().global
-					data.global.hold = type(data.global.hold) == "table" and data.global.hold or {}
-					for name, m in pairs(data.maps) do
-						if type(m) == "table" then normalize(m) else data.maps[name] = nil end
-					end
-				else
-					-- keep the unreadable file instead of silently overwriting it
-					pcall(function() writefile(FILE .. ".bak", raw) end)
-				end
+	if canSave then
+		local ok, raw = pcall(readfile, FILE)
+		if ok and type(raw) == "string" and raw ~= "" then
+			local okJson, decoded = pcall(function() return HttpService:JSONDecode(raw) end)
+			if okJson and type(decoded) == "table" and type(decoded.maps) == "table" then
+				data = decoded
+				data.rounds = tonumber(data.rounds) or 0
+				data.coins = tonumber(data.coins) or 0
 			end
 		end
-		data.global.sessions = (data.global.sessions or 0) + 1
-		dirty = true
-	end
-
-	function Memory.prune()
-		local names = {}
-		for name in pairs(data.maps) do names[#names + 1] = name end
-		if #names > MAX_MAPS then
-			table.sort(names, function(a, b)
-				return (data.maps[a].lastSeen or 0) > (data.maps[b].lastSeen or 0)
-			end)
-			for i = MAX_MAPS + 1, #names do data.maps[names[i]] = nil end
-		end
-		for _, m in pairs(data.maps) do
-			trimTable(m.cells, MAX_CELLS, function(c) return (c.s or 0) + (c.o or 0) + (c.f or 0) end)
-			trimTable(m.ground, MAX_GROUND, nil)
-		end
-	end
-
-	function Memory.save(force)
-		if not canFs or not data or not dirty then return end
-		if not force and os.clock() - lastSave < CFG.autosave then return end
-		lastSave = os.clock()
-		Memory.prune()
-		local ok, encoded = pcall(function() return HttpService:JSONEncode(data) end)
-		if not ok then return end
-		local wrote = pcall(function()
-			if hasFolders and not isfolder(DIR) then makefolder(DIR) end
-			writefile(FILE, encoded)
-		end)
-		if wrote then dirty = false end
 	end
 
 	function Memory.map(name)
 		local m = data.maps[name]
-		if not m then
-			m = normalize({})
+		if type(m) ~= "table" then
+			m = {}
 			data.maps[name] = m
 		end
-		m.lastSeen = os.time()
+		m.spots = type(m.spots) == "table" and m.spots or {}
+		m.zones = type(m.zones) == "table" and m.zones or {}
+		m.rounds = tonumber(m.rounds) or 0
+		m.avg = tonumber(m.avg)
+		m.seen = os.time()
 		dirty = true
 		return m
 	end
 
-	function Memory.forget(name)
-		if name and data.maps[name] then
-			data.maps[name] = nil
-			dirty = true
+	local function spot(m, p)
+		local k = key(p, SPOT)
+		local s = m.spots[k]
+		if type(s) ~= "table" then
+			s = { s = 0, h = 0, m = 0 }
+			m.spots[k] = s
 		end
+		return s
 	end
 
-	local function cell(m, pos)
-		local k = key3(pos)
-		local c = m.cells[k]
-		if not c then
-			c = { s = 0, o = 0, f = 0 }
-			m.cells[k] = c
+	function Memory.spawned(m, p)
+		local s = spot(m, p)
+		s.s = (s.s or 0) + 1
+		dirty = true
+	end
+
+	function Memory.result(m, p, hit)
+		local s = spot(m, p)
+		if hit then s.h = (s.h or 0) + 1 else s.m = (s.m or 0) + 1 end
+		dirty = true
+	end
+
+	function Memory.died(m, p)
+		local k = key(p, ZONE)
+		m.zones[k] = (tonumber(m.zones[k]) or 0) + 1
+		dirty = true
+	end
+
+	-- >= 1: spots that keep failing and places we died at are visited last, never skipped.
+	function Memory.penalty(m, p)
+		local penalty = 1
+		local s = m.spots[key(p, SPOT)]
+		if type(s) == "table" and (s.m or 0) > 0 then
+			penalty += math.min(3, s.m / ((s.h or 0) + 1))
 		end
-		return c
+		return penalty + math.min(3, tonumber(m.zones[key(p, ZONE)]) or 0)
 	end
 
-	function Memory.noteSpawn(m, pos)
-		if not CFG.learning then return end
-		local c = cell(m, pos)
-		c.s += 1
-		dirty = true
-	end
-
-	function Memory.noteResult(m, pos, success)
-		if not CFG.learning then return end
-		local c = cell(m, pos)
-		if success then c.o += 1 else c.f += 1 end
-		dirty = true
-	end
-
-	-- Laplace-style estimate; unknown spots are treated as reliable.
-	function Memory.reliability(m, pos)
-		local c = m.cells[key3(pos)]
-		if not c then return 1 end
-		return (c.o + 1) / (c.o + c.f + 1)
-	end
-
-	function Memory.failCount(m, pos)
-		local c = m.cells[key3(pos)]
-		return c and c.f or 0
-	end
-
-	function Memory.ground(m, pos)
-		return m.ground[key3(pos)]
-	end
-
-	function Memory.setGround(m, pos, y)
-		if not CFG.learning then return end
-		m.ground[key3(pos)] = math.floor(y * 10 + 0.5) / 10
-		dirty = true
-	end
-
-	function Memory.noteDeath(m, pos, mode)
-		if not CFG.learning then return end
-		local k = key2(pos)
-		m.danger[k] = (m.danger[k] or 0) + 1
-		m.deaths += 1
-		if m.modes[mode] then m.modes[mode].deaths += 1 end
-		dirty = true
-	end
-
-	function Memory.danger(m, pos)
-		return m.danger[key2(pos)] or 0
-	end
-
-	function Memory.noteRound(m, coins)
-		if not CFG.learning then return end
-		m.rounds += 1
-		m.coinsEma = ema(m.coinsEma, coins, 0.3)
-		-- old deaths matter less over time
-		for k, v in pairs(m.danger) do
-			v *= 0.9
-			m.danger[k] = v >= 0.2 and v or nil
-		end
-		dirty = true
-	end
-
-	function Memory.noteMode(m, mode, coins, seconds)
-		if not CFG.learning then return end
-		local s = m.modes[mode]
-		if not s then return end
-		s.coins += coins
-		s.time += seconds
-		data.global.coins = (data.global.coins or 0) + coins
-		dirty = true
-	end
-
-	-- Coins per second, with each death charged as 30s of lost farming.
-	function Memory.modeRate(m, mode)
-		local s = m.modes[mode]
-		if not s or s.time <= 0 then return nil end
-		return s.coins / (s.time + s.deaths * 30)
-	end
-
-	function Memory.pickMode(m)
-		local n, d = m.modes.normal, m.modes.dive
-		if n.time < MIN_MODE_TIME or d.time < MIN_MODE_TIME then
-			return n.time <= d.time and "normal" or "dive"
-		end
-		local best = (Memory.modeRate(m, "normal") or 0) >= (Memory.modeRate(m, "dive") or 0) and "normal" or "dive"
-		if rng:NextNumber() < CFG.exploreRate then
-			return best == "normal" and "dive" or "normal"
+	-- Most frequent coin spawn spot, nearby ones preferred.
+	function Memory.hotspot(m, from)
+		local best, bestScore
+		for k, s in pairs(m.spots) do
+			if type(s) == "table" and (s.s or 0) >= 3 then
+				local c = center(k)
+				if c then
+					local score = s.s / (1 + (c - from).Magnitude / 100)
+					if not bestScore or score > bestScore then best, bestScore = c, score end
+				end
+			end
 		end
 		return best
 	end
 
-	function Memory.noteHold(method, success)
-		if not CFG.learning then return end
-		local h = data.global.hold[method] or { o = 0, f = 0 }
-		data.global.hold[method] = h
-		if success then h.o += 1 else h.f += 1 end
+	function Memory.roundEnded(m, coins)
+		m.rounds += 1
+		m.avg = m.avg and (m.avg * 0.7 + coins * 0.3) or coins
+		data.rounds += 1
+		data.coins += coins
+		for k, v in pairs(m.zones) do
+			v = (tonumber(v) or 0) * 0.8
+			m.zones[k] = v >= 0.2 and v or nil
+		end
 		dirty = true
 	end
 
-	function Memory.pickHold(default)
-		local a, h = data.global.hold.anchor, data.global.hold.hover
-		if not a or not h then return default end
-		if a.o + a.f < MIN_HOLD_SAMPLES or h.o + h.f < MIN_HOLD_SAMPLES then return default end
-		return (a.o / (a.o + a.f)) >= (h.o / (h.o + h.f)) and "anchor" or "hover"
-	end
-
-	function Memory.setBagCap(n)
-		if type(n) == "number" and n > 0 and data.global.bagCap ~= n then
-			data.global.bagCap = n
-			dirty = true
+	local function prune()
+		local names = {}
+		for name, m in pairs(data.maps) do
+			if type(m) == "table" then names[#names + 1] = name else data.maps[name] = nil end
 		end
-	end
-
-	function Memory.bagCap()
-		return data.global.bagCap
-	end
-
-	-- Best spot to wait for respawning coins: frequent spawn cells, nearby preferred.
-	function Memory.hotspot(m, from)
-		local bestPos, bestGround, bestScore
-		for k, c in pairs(m.cells) do
-			if c.s >= 2 then
-				local pos = center3(k)
-				if pos then
-					local score = c.s / (1 + (pos - from).Magnitude / 150)
-					if not bestScore or score > bestScore then
-						bestPos, bestGround, bestScore = pos, m.ground[k], score
-					end
+		table.sort(names, function(a, b) return (data.maps[a].seen or 0) > (data.maps[b].seen or 0) end)
+		for i = MAX_MAPS + 1, #names do data.maps[names[i]] = nil end
+		for _, m in pairs(data.maps) do
+			local keys = {}
+			for k in pairs(m.spots or {}) do keys[#keys + 1] = k end
+			if #keys > MAX_SPOTS then
+				local function weight(k)
+					local s = m.spots[k]
+					return type(s) == "table" and (s.s or 0) + (s.h or 0) + (s.m or 0) or 0
 				end
+				table.sort(keys, function(a, b) return weight(a) > weight(b) end)
+				for i = MAX_SPOTS + 1, #keys do m.spots[keys[i]] = nil end
 			end
 		end
-		return bestPos, bestGround
 	end
 
-	function Memory.summary()
-		local maps, cells = 0, 0
+	function Memory.save(force)
+		if not canSave or not dirty then return end
+		if not force and os.clock() - lastSave < 30 then return end
+		lastSave = os.clock()
+		prune()
+		local ok, json = pcall(function() return HttpService:JSONEncode(data) end)
+		if ok and pcall(writefile, FILE, json) then dirty = false end
+	end
+
+	function Memory.stats()
+		local maps, spots = 0, 0
 		for _, m in pairs(data.maps) do
 			maps += 1
-			for _ in pairs(m.cells) do cells += 1 end
+			for _ in pairs(m.spots or {}) do spots += 1 end
 		end
-		return maps, cells, data.global.sessions or 0
+		return maps, spots
 	end
 end
 
-Memory.load()
-state.holdMethod = Memory.pickHold(CFG.holdMethod)
+---------------------------------------------------------------------------
+-- State
+---------------------------------------------------------------------------
+local state = {
+	running = true,
+	parking = false,
+	mode = "normal", -- "normal" | "dive"
+	phase = "",
+	map = nil,
+	pivot = nil,
+	mem = nil,
+	roundDone = nil, -- "bag_full" | "dead": sit out the rest of the round
+	roundCoins = 0,
+	totalCoins = 0,
+	misses = 0,
+	safeSpot = nil,
+	cooldownUntil = 0,
+	lastError = nil,
+}
 
----------------------------------------------------------------------------
--- Character control
----------------------------------------------------------------------------
+local retryAt = setmetatable({}, { __mode = "k" })
+local firstPos = setmetatable({}, { __mode = "k" })
+local hadVisual = setmetatable({}, { __mode = "k" })
+local seenCoin = setmetatable({}, { __mode = "k" })
+local boundsCache = setmetatable({}, { __mode = "k" })
+
+local PHASE_TEXT = {
+	off = "выключено",
+	waiting = "ждём раунд",
+	farming = "сбор монет",
+	no_coins = "ждём новые монеты",
+	bag_full = "мешок полон — ждём следующий раунд",
+	dead = "персонаж погиб — ждём следующий раунд",
+	wrong_game = "это не MM2",
+	error = "ошибка",
+}
+
+local function setPhase(phase)
+	if state.phase ~= phase then
+		state.phase = phase
+		print("[MM2] " .. (PHASE_TEXT[phase] or phase))
+	end
+end
+
+local function toLocal(pos)
+	return state.pivot and state.pivot:PointToObjectSpace(pos) or pos
+end
+
+local function toWorld(pos)
+	return state.pivot and state.pivot:PointToWorldSpace(pos) or pos
+end
+
 local function getChar()
 	local char = LocalPlayer.Character
 	if not char then return nil end
-	return char, char:FindFirstChildOfClass("Humanoid"), char:FindFirstChild("HumanoidRootPart")
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hum or not hrp or hum.Health <= 0 then return nil end
+	return char, hum, hrp
 end
 
-local function setFrozen(on)
-	local _, hum, hrp = getChar()
-	state.frozen = on
-	if on then
-		if hrp then
-			state.holdCFrame = hrp.CFrame
-			pcall(function() hrp.Anchored = state.holdMethod == "anchor" end)
-		end
-		if hum then
-			pcall(function()
-				hum.AutoRotate = false
-				hum.PlatformStand = true
-			end)
-		end
-	else
-		state.holdCFrame = nil
-		if hrp then pcall(function() hrp.Anchored = false end) end
-		if hum then
-			pcall(function()
-				hum.AutoRotate = true
-				hum.PlatformStand = false
-			end)
-		end
+---------------------------------------------------------------------------
+-- Flight controller. The root part stays unanchored: an anchored root stops
+-- replicating its position, so the server never sees you reach the coins.
+---------------------------------------------------------------------------
+local ctrl = {
+	engaged = false,
+	pos = nil, -- where we keep the root part
+	target = nil,
+	rot = CFrame.identity,
+	displaced = false,
+	diedAt = nil,
+	collide = setmetatable({}, { __mode = "k" }),
+}
+
+local function release()
+	if not ctrl.engaged then return end
+	ctrl.engaged = false
+	ctrl.target = nil
+	for part, original in pairs(ctrl.collide) do
+		if part.Parent then pcall(function() part.CanCollide = original end) end
 	end
+	table.clear(ctrl.collide)
+	local hum, hrp = ctrl.hum, ctrl.hrp
+	pcall(function()
+		if hrp.Parent then
+			hrp.Anchored = false
+			hrp.AssemblyLinearVelocity = Vector3.zero
+		end
+		if hum.Parent then
+			hum.PlatformStand = false
+			if ctrl.seat ~= nil then hum:SetStateEnabled(Enum.HumanoidStateType.Seated, ctrl.seat) end
+			if hum.Health > 0 then hum:ChangeState(Enum.HumanoidStateType.Freefall) end
+		end
+	end)
 end
 
-local function setNoclip(on)
-	state.noclip = on
-	if on then return end -- enforced every Stepped while on
-	for part, value in pairs(partCollide) do
-		if part and part.Parent then pcall(function() part.CanCollide = value end) end
+local function engage(char, hum, hrp)
+	if not stillOwner() then return false end
+	if ctrl.engaged then
+		if ctrl.hrp == hrp then return true end
+		release()
 	end
-	table.clear(partCollide)
+	local _, yaw = hrp.CFrame:ToOrientation()
+	ctrl.engaged = true
+	ctrl.char, ctrl.hum, ctrl.hrp = char, hum, hrp
+	ctrl.pos, ctrl.target = hrp.Position, nil
+	ctrl.rot = CFrame.Angles(0, yaw, 0)
+	ctrl.displaced = false
+	pcall(function()
+		hrp.Anchored = false
+		ctrl.seat = hum:GetStateEnabled(Enum.HumanoidStateType.Seated)
+		hum:SetStateEnabled(Enum.HumanoidStateType.Seated, false) -- flying through a seat would sit us down
+		hum.Sit = false
+		hum.PlatformStand = true
+	end)
+	return true
 end
 
-local function resetCharacter()
-	setNoclip(false)
-	setFrozen(false)
-	local _, hum = getChar()
-	if hum and hum.Health > 0 then
-		pcall(function() hum:ChangeState(Enum.HumanoidStateType.Freefall) end)
-	end
-end
+local connections = {}
 
--- Humanoids re-enable collision on body parts each step, so noclip must be reapplied.
-track(RunService.Stepped:Connect(function()
-	if not state.noclip or not stillOwner() then return end
-	local char = LocalPlayer.Character
-	if not char then return end
+-- Humanoids re-enable collisions every step, so noclip is reapplied each Stepped.
+connections[#connections + 1] = RunService.Stepped:Connect(function()
+	if not ctrl.engaged or not stillOwner() then return end
+	local char = ctrl.char
+	if not char or not char.Parent then return end
 	for _, part in ipairs(char:GetDescendants()) do
 		if part:IsA("BasePart") and part.CanCollide then
-			if partCollide[part] == nil then partCollide[part] = true end
+			if ctrl.collide[part] == nil then ctrl.collide[part] = true end
 			part.CanCollide = false
 		end
 	end
-end))
+end)
 
--- Keeps the character in place between tweens; "hover" stays unanchored so
--- physics/touch replication keeps working.
-track(RunService.Heartbeat:Connect(function()
-	if not state.frozen or not stillOwner() then return end
-	local _, hum, hrp = getChar()
-	if not hrp then return end
-	local anchor = state.holdMethod == "anchor"
-	if hrp.Anchored ~= anchor then hrp.Anchored = anchor end
-	if not anchor then
-		hrp.AssemblyLinearVelocity = Vector3.zero
-		hrp.AssemblyAngularVelocity = Vector3.zero
-		if not state.tweening and state.holdCFrame then hrp.CFrame = state.holdCFrame end
+connections[#connections + 1] = RunService.Heartbeat:Connect(function(dt)
+	if not ctrl.engaged then return end
+	if not stillOwner() then
+		ctrl.engaged = false -- a newer instance owns the character now
+		return
 	end
-	if hum and not hum.PlatformStand then hum.PlatformStand = true end
-end))
-
----------------------------------------------------------------------------
--- Game signals (optional). If these remotes are absent we fall back to
--- heuristics, so nothing here is required for farming.
----------------------------------------------------------------------------
-local function onCoinCollected(...)
-	local nums = {}
-	for i = 1, select("#", ...) do
-		local n = tonumber((select(i, ...)))
-		if n then nums[#nums + 1] = n end
+	local hrp, hum = ctrl.hrp, ctrl.hum
+	if not hrp.Parent or not hum.Parent or hum.Health <= 0 then
+		ctrl.diedAt = ctrl.pos
+		release()
+		return
 	end
-	state.coinSignalSeen = true
-	state.lastCoinSignal = os.clock()
-	if #nums >= 2 and nums[2] > 0 then
-		state.bagCount, state.bagMax = nums[1], nums[2]
-		Memory.setBagCap(nums[2])
-		if nums[1] >= nums[2] then state.bagFull = true end
+	if (hrp.Position - ctrl.pos).Magnitude > 12 then
+		-- the game moved us (round-end teleport, respawn): hand control back
+		ctrl.displaced = true
+		release()
+		return
 	end
-end
-
-local function hookRemotes()
-	local function find(name)
-		local ok, r = pcall(function() return ReplicatedStorage:FindFirstChild(name, true) end)
-		if ok and r and r:IsA("RemoteEvent") then return r end
-		return nil
+	local target = ctrl.target
+	if target then
+		local delta = target - ctrl.pos
+		local step = CFG.speed * math.min(dt, 0.1)
+		ctrl.pos = delta.Magnitude <= step and target or ctrl.pos + delta.Unit * step
 	end
-	local coinEv = find("CoinCollected")
-	if coinEv then
-		state.coinRemoteHooked = true
-		track(coinEv.OnClientEvent:Connect(onCoinCollected))
-	end
-	local startEv = find("RoundStart")
-	if startEv then
-		track(startEv.OnClientEvent:Connect(function()
-			state.roundStartSignal = true
-			state.bagCount = 0
-		end))
-	end
-	local endEv = find("RoundEndFade")
-	if endEv then
-		track(endEv.OnClientEvent:Connect(function()
-			state.roundEndSignal = true
-		end))
-	end
-end
-pcall(hookRemotes)
+	hrp.AssemblyLinearVelocity = Vector3.zero
+	hrp.AssemblyAngularVelocity = Vector3.zero
+	hrp.CFrame = CFrame.new(ctrl.pos) * ctrl.rot
+end)
 
 ---------------------------------------------------------------------------
--- World queries
+-- World
 ---------------------------------------------------------------------------
-local function getCoinContainers()
-	local list = {}
-	for _, model in ipairs(Workspace:GetChildren()) do
-		local cc = model:FindFirstChild("CoinContainer")
-		if cc and cc:IsA("Model") then
-			list[#list + 1] = cc
-		end
+local function findMap()
+	local current = state.map
+	if current and current.Parent then
+		local cc = current:FindFirstChild("CoinContainer")
+		if cc then return current, cc end
 	end
-	if #list == 0 then
-		for _, model in ipairs(Workspace:GetChildren()) do
-			if model:IsA("Model") or model:IsA("Folder") then
-				for _, sub in ipairs(model:GetChildren()) do
-					local cc = sub:FindFirstChild("CoinContainer")
-					if cc and cc:IsA("Model") then
-						list[#list + 1] = cc
-					end
-				end
+	local fallback, fallbackCC
+	for _, obj in ipairs(Workspace:GetChildren()) do
+		if obj.Name ~= "Lobby" then
+			local cc = obj:FindFirstChild("CoinContainer")
+			if cc then
+				if obj:GetAttribute("MapID") ~= nil then return obj, cc end
+				fallback, fallbackCC = fallback or obj, fallbackCC or cc
 			end
 		end
 	end
-	return list
-end
-
--- Distance to the nearest coin, falling back to the map pivot when empty.
-local function containerDistance(cc, from)
-	local best
-	for _, c in ipairs(cc:GetChildren()) do
-		if c:IsA("BasePart") then
-			local d = (c.Position - from).Magnitude
-			if not best or d < best then best = d end
+	if fallback then return fallback, fallbackCC end
+	for _, obj in ipairs(Workspace:GetChildren()) do
+		if obj.Name ~= "Lobby" and (obj:IsA("Model") or obj:IsA("Folder")) then
+			for _, sub in ipairs(obj:GetChildren()) do
+				local cc = sub:FindFirstChild("CoinContainer")
+				if cc then return sub, cc end
+			end
 		end
 	end
-	if best then return best end
-	local ok, pos = pcall(function() return (cc.Parent or cc):GetPivot().Position end)
-	return ok and pos and (pos - from).Magnitude or math.huge
-end
-
-local function mapNameOf(cc)
-	local parent = cc.Parent
-	if parent and parent ~= Workspace then return parent.Name end
-	return "unknown"
-end
-
-local function pickContainer(hrp)
-	-- the current round's container stays selected even after it empties out
-	local current = state.roundContainer
-	if state.inRound and current and current.Parent then
-		return current, mapNameOf(current)
-	end
-	local best, bestD
-	for _, cc in ipairs(getCoinContainers()) do
-		local d = containerDistance(cc, hrp.Position)
-		if d <= CFG.maxMapDist and (not bestD or d < bestD) then
-			best, bestD = cc, d
-		end
-	end
-	if best then return best, mapNameOf(best) end
 	return nil
 end
 
-local function coinGone(coin)
-	if coin.Parent == nil then return true end
-	local collected = false
-	pcall(function() collected = coin:GetAttribute("Collected") == true end)
-	if collected then return true end
-	local transparent = false
-	pcall(function() transparent = coin.Transparency >= 0.95 end)
-	return transparent
+local function nearMap(map, pos)
+	local entry = boundsCache[map]
+	if not entry or os.clock() - entry.t > 5 then
+		local ok, cf, size = pcall(function() return map:GetBoundingBox() end)
+		entry = { t = os.clock(), cf = ok and cf or nil, size = ok and size or nil }
+		boundsCache[map] = entry
+	end
+	if not entry.cf then return true end
+	local p = entry.cf:PointToObjectSpace(pos)
+	local half, m = entry.size / 2, CFG.mapMargin
+	return math.abs(p.X) <= half.X + m and math.abs(p.Y) <= half.Y + m and math.abs(p.Z) <= half.Z + m
 end
 
-local function listCoins(containers)
+local function roundOver()
+	return LocalPlayer:GetAttribute("Alive") == false or not (state.map and state.map.Parent)
+end
+
+local function coinPos(coin)
+	local ok, cf = pcall(coin.GetPivot, coin)
+	return ok and cf.Position or nil
+end
+
+-- Current MM2 marks taken coins with a "Collected" attribute on their CoinVisual;
+-- coins without a visual are live while they still have a TouchInterest.
+local function coinAlive(coin)
+	if not coin.Parent then return false end
+	local visual = coin:FindFirstChild("CoinVisual")
+	if visual then
+		hadVisual[coin] = true
+		if visual:GetAttribute("Collected") then return false end
+	elseif hadVisual[coin] or not coin:FindFirstChildWhichIsA("TouchTransmitter") then
+		return false
+	end
+	local pos = coinPos(coin)
+	if not pos then return false end
+	local first = firstPos[coin]
+	if not first then
+		firstPos[coin] = pos
+	elseif (pos - first).Magnitude > 2 then
+		return false -- moved away by the game: already taken or a decoy
+	end
+	return true
+end
+
+local function listCoins(cc)
 	local now = os.clock()
-	local list = {}
-	for _, cc in ipairs(containers) do
-		for _, c in ipairs(cc:GetChildren()) do
-			if c:IsA("BasePart") and c.Name == "Coin_Server" and not coinGone(c) and (blacklist[c] or 0) < now then
-				list[#list + 1] = c
+	local coins = {}
+	for _, coin in ipairs(cc:GetChildren()) do
+		if (coin:IsA("BasePart") or coin:IsA("Model")) and (retryAt[coin] or 0) <= now and coinAlive(coin) then
+			coins[#coins + 1] = coin
+		end
+	end
+	return coins
+end
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
+pcall(function() rayParams.RespectCanCollide = true end)
+
+local function floorBelow(pos)
+	local ignore = {}
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player.Character then ignore[#ignore + 1] = player.Character end
+	end
+	local cc = state.map and state.map:FindFirstChild("CoinContainer")
+	if cc then ignore[#ignore + 1] = cc end
+	rayParams.FilterDescendantsInstances = ignore
+	local ok, hit = pcall(function()
+		return Workspace:Raycast(pos + Vector3.new(0, 1, 0), Vector3.new(0, -150, 0), rayParams)
+	end)
+	return ok and hit and hit.Position.Y or nil
+end
+
+local function diveY(floorY)
+	return math.max(floorY - CFG.diveDepth, Workspace.FallenPartsDestroyHeight + 25)
+end
+
+-- Maps hide "Glitch"/"Invis" models that kill or reset anyone passing through
+-- walls or under the floor; removing our local copy stops those touches.
+local function clearTraps(map)
+	for _, d in ipairs(map:GetDescendants()) do
+		if d:IsA("Model") and (d.Name:find("Glitch", 1, true) or d.Name:find("Invis", 1, true)) then
+			pcall(function() d:Destroy() end)
+		end
+	end
+end
+
+-- Reads the bag HUD: known, every bag full, any bag full.
+local function bagUI()
+	local ok, known, all, any = pcall(function()
+		local container = LocalPlayer.PlayerGui.MainGUI.Game.CoinBags.Container
+		local known, all, any = false, true, false
+		for _, bag in ipairs(container:GetChildren()) do
+			local icon = bag:FindFirstChild("FullBagIcon")
+			if icon and bag:IsA("GuiObject") and bag.Visible then
+				known = true
+				if icon.Visible then any = true else all = false end
 			end
 		end
-	end
-	return list
-end
-
-local function roundSeconds()
-	local rt = Workspace:FindFirstChild("RoundTimerPart")
-	if not rt then return nil end
-	for _, d in ipairs(rt:GetDescendants()) do
-		if d:IsA("TextLabel") then
-			local text = d.Text
-			local m, s = text:match("(%d+)%s*:%s*(%d+)")
-			if not m then m, s = text:match("(%d+)%s*m%s*(%d+)%s*s") end
-			if m and s then return tonumber(m) * 60 + tonumber(s) end
-			local only = text:match("^%s*(%d+)%s*s?%s*$")
-			if only then return tonumber(only) end
-		end
-	end
-	return nil
-end
-
-local function makeRayParams(containers)
-	local filter = {}
-	for _, p in ipairs(Players:GetPlayers()) do
-		if p.Character then filter[#filter + 1] = p.Character end
-	end
-	for _, cc in ipairs(containers or {}) do filter[#filter + 1] = cc end
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = filter
-	params.IgnoreWater = true
-	return params
-end
-
-local function groundY(pos, params)
-	local ok, result = pcall(function()
-		return Workspace:Raycast(pos + Vector3.new(0, 2, 0), Vector3.new(0, -140, 0), params)
+		return known, all, any
 	end)
-	if ok and result then return result.Position.Y, true end
-	return pos.Y - 16, false
+	if not ok or not known then return false, false, false end
+	return true, all, any
 end
 
--- Coin position + ground height; ground is cached per coin and in memory.
-local function coinInfo(coin, m, params)
-	local cached = coinGround[coin]
-	if cached then return cached end
-	local ok, pos = pcall(function() return coin.Position end)
-	if not ok or not pos then return nil end
-	local gy = m and Memory.ground(m, pos)
-	if not gy then
-		local hit
-		gy, hit = groundY(pos, params)
-		if hit and m then Memory.setGround(m, pos, gy) end
+local function bagIsFull()
+	local known, all, any = bagUI()
+	if known and all then return true end
+	if known and any then return state.misses >= 2 end
+	-- the HUD may be missing or misread, so repeated misses still end the round
+	return state.misses >= (known and CFG.missLimit * 2 or CFG.missLimit)
+end
+
+---------------------------------------------------------------------------
+-- Movement
+---------------------------------------------------------------------------
+local function moveTo(target, abort)
+	if not ctrl.engaged then return false end
+	ctrl.target = target
+	while ctrl.engaged do
+		if (ctrl.pos - target).Magnitude < 0.05 then return true end
+		if not stillOwner() or not (state.running or state.parking) then break end
+		if abort and abort() then break end
+		RunService.Heartbeat:Wait()
 	end
-	local info = { pos = pos, gy = gy }
-	coinGround[coin] = info
-	return info
-end
-
-local function hasKnife(player)
-	local found = false
-	pcall(function()
-		local char = player.Character
-		local backpack = player:FindFirstChildOfClass("Backpack")
-		found = (char and char:FindFirstChild("Knife") ~= nil) or (backpack and backpack:FindFirstChild("Knife") ~= nil) or false
-	end)
-	return found
-end
-
-local function murdererPositions()
-	local list = {}
-	if hasKnife(LocalPlayer) then return list end
-	for _, p in ipairs(Players:GetPlayers()) do
-		if p ~= LocalPlayer and hasKnife(p) then
-			local root = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
-			if root then list[#list + 1] = root.Position end
-		end
-	end
-	return list
-end
-
-local function nearThreat(pos, threats, radius)
-	for _, t in ipairs(threats) do
-		if (t - pos).Magnitude < radius then return true end
-	end
+	ctrl.target = nil
 	return false
 end
 
----------------------------------------------------------------------------
--- Movement and collection
----------------------------------------------------------------------------
-local function tweenTo(hrp, targetPos, guard)
-	if not hrp or not hrp.Parent then return false end
-	local okStart, startPos = pcall(function() return hrp.Position end)
-	if not okStart then return false end
-	local dist = (targetPos - startPos).Magnitude
-	if dist < 0.2 then return true end
-	local duration = math.max(dist / math.max(CFG.speed, 1), 0.03)
-	local goal = CFrame.new(targetPos) * hrp.CFrame.Rotation
-	local tween = TweenService:Create(hrp, TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out), { CFrame = goal })
-	state.tweening = true
-	tween:Play()
-
-	local function finish(success)
-		if tween.PlaybackState == Enum.PlaybackState.Playing then tween:Cancel() end
-		tween:Destroy()
-		state.tweening = false
-		if hrp.Parent then state.holdCFrame = success and goal or hrp.CFrame end
-		return success
-	end
-
-	while tween.PlaybackState == Enum.PlaybackState.Playing do
-		if not state.running or not stillOwner() then return finish(false) end
-		if guard and guard() == false then return finish(false) end
-		local _, hum = getChar()
-		if not hum or hum.Health <= 0 or not hrp.Parent then return finish(false) end
-		RunService.Heartbeat:Wait()
-	end
-	-- a tween cancelled from outside (e.g. respawn) must not count as arrival
-	return finish(tween.PlaybackState == Enum.PlaybackState.Completed)
-end
-
-local function coinDistance(coinPos)
-	local _, _, hrp = getChar()
-	if not hrp then return math.huge end
-	return (coinPos - hrp.Position).Magnitude
-end
-
--- Prefers the game's own CoinCollected signal once it has been observed;
--- otherwise "gone while we were touching it" counts as ours.
-local function wasCollected(coin, coinPos, t0)
-	if state.coinSignalSeen then
-		local deadline = os.clock() + CFG.signalWait
-		repeat
-			if state.lastCoinSignal and state.lastCoinSignal >= t0 then return true end
-			if not coinGone(coin) then return false end
-			task.wait()
-		until os.clock() > deadline
-		return false
-	end
-	return coinGone(coin) and coinDistance(coinPos) <= CFG.collectRadius
-end
-
-local function touchCoin(hrp, coinPos, coin, guard)
-	if coinGone(coin) then return true end
-	if not tweenTo(hrp, coinPos, guard) then return false end
-	task.wait(CFG.touchHold)
-	if coinGone(coin) then return true end
-	if not tweenTo(hrp, coinPos + Vector3.new(1.2, 0, 0), guard) then return false end
-	if coinGone(coin) then return true end
-	if not tweenTo(hrp, coinPos - Vector3.new(1.2, 0, 0), guard) then return false end
-	task.wait(CFG.touchHold)
-	return coinGone(coin)
-end
-
-local function collectCoin(coin, info, cc, mode)
-	local _, hum, hrp = getChar()
-	if not hrp or not hum or hum.Health <= 0 then return "aborted" end
-	local coinPos = info.pos
-	local t0 = os.clock()
-	local checkThreats = mode == "normal" and CFG.avoidMurderer
-	local nextThreatCheck = 0
-
-	local guard = function()
-		if not cc.Parent or state.roundEndSignal then return false end
-		if checkThreats and os.clock() >= nextThreatCheck then
-			nextThreatCheck = os.clock() + 0.15
-			if nearThreat(coinPos, murdererPositions(), CFG.dangerRadius * 0.6) then return false end
-		end
-		return true
-	end
-
-	local function outcome(touched)
-		if wasCollected(coin, coinPos, t0) then return "collected" end
-		if coinGone(coin) or touched then return "gone" end
-		return "failed"
-	end
-
-	if mode == "dive" then
-		local under = Vector3.new(coinPos.X, info.gy - CFG.diveDepth, coinPos.Z)
-		if not tweenTo(hrp, under, guard) then return "aborted" end
-		if not coinGone(coin) and not tweenTo(hrp, coinPos, guard) then return "aborted" end
-		local touched = coinGone(coin) or touchCoin(hrp, coinPos, coin, guard)
-		local result = outcome(touched)
-		tweenTo(hrp, under, guard)
-		return result
-	end
-
-	if not tweenTo(hrp, coinPos, guard) then return "aborted" end
-	local touched = coinGone(coin) or touchCoin(hrp, coinPos, coin, guard)
-	return outcome(touched)
-end
-
-local function moveCost(from, info, mode)
-	if mode == "dive" then
-		local under = Vector3.new(info.pos.X, info.gy - CFG.diveDepth, info.pos.Z)
-		return (under - from).Magnitude + (info.pos - under).Magnitude
-	end
-	return (info.pos - from).Magnitude
-end
-
--- Two-step greedy route: rank by travel / learned reliability (+ death-zone
--- penalty), then re-rank the best few by how close they leave us to the next coin.
-local function chooseCoin(coins, from, m, mode, threats, params)
-	local scored = {}
-	for _, coin in ipairs(coins) do
-		local info = coinInfo(coin, m, params)
-		if info and not seenCoins[coin] then
-			seenCoins[coin] = true
-			Memory.noteSpawn(m, info.pos)
-		end
-		if info and not (mode == "normal" and nearThreat(info.pos, threats, CFG.dangerRadius)) then
-			local cost = moveCost(from, info, mode) / Memory.reliability(m, info.pos)
-			if mode == "normal" then cost *= 1 + 0.5 * Memory.danger(m, info.pos) end
-			scored[#scored + 1] = { coin = coin, info = info, cost = cost }
-		end
-	end
-	if #scored == 0 then return nil end
-	table.sort(scored, function(a, b) return a.cost < b.cost end)
-
-	local best, bestTotal
-	for i = 1, math.min(8, #scored) do
-		local cand = scored[i]
-		local nextD = 0
-		if CFG.lookahead > 0 and #scored > 1 then
-			nextD = math.huge
-			for _, other in ipairs(scored) do
-				if other ~= cand then
-					local d = (other.info.pos - cand.info.pos).Magnitude
-					if d < nextD then nextD = d end
-				end
+local function parkAndRelease(waitForTeleport)
+	local spot = state.safeSpot
+	if ctrl.engaged and spot then
+		if waitForTeleport and ctrl.pos.Y < spot.Y - 8 then
+			-- "Alive" can flip just before the round-end teleport; don't drop into the void meanwhile
+			local deadline = os.clock() + 4
+			while ctrl.engaged and stillOwner() and os.clock() < deadline do
+				RunService.Heartbeat:Wait()
 			end
 		end
-		local total = cand.cost + CFG.lookahead * nextD
-		if not bestTotal or total < bestTotal then best, bestTotal = cand, total end
+		if ctrl.engaged then
+			state.parking = true
+			moveTo(spot)
+			state.parking = false
+		end
 	end
-	return best.coin, best.info
+	release()
 end
 
-local function parkAt(pos)
-	local _, hum, hrp = getChar()
-	if not hrp or not pos or not hum or hum.Health <= 0 then return end
-	tweenTo(hrp, pos, nil)
+local fireTouch = firetouchinterest
+local function touch(coin)
+	local hrp = ctrl.hrp
+	local part = coin:IsA("BasePart") and coin or coin:FindFirstChildWhichIsA("BasePart")
+	if type(fireTouch) ~= "function" or not hrp or not part then return end
+	pcall(fireTouch, hrp, part, 0)
+	pcall(fireTouch, hrp, part, 1)
 end
 
-local function parkAtSafe()
-	parkAt(state.lastSafe)
-end
+local NUDGES = {
+	Vector3.new(1.5, 0, 0),
+	Vector3.new(-1.5, 0, 0),
+	Vector3.new(0, 0, 1.5),
+	Vector3.new(0, 0, -1.5),
+	Vector3.zero,
+}
 
--- Wait for respawns where coins historically appear most.
-local function parkAtHotspot(hrp, params, threats)
-	local m = state.roundMap
-	if not m then parkAtSafe() return end
-	local pos, gy = Memory.hotspot(m, hrp.Position)
-	if not pos then parkAtSafe() return end
-	if not gy then gy = groundY(pos, params) end
-	if state.activeMode == "dive" then
-		parkAt(Vector3.new(pos.X, gy - CFG.diveDepth, pos.Z))
-		return
+local function collect(coin, pos, floorY)
+	local function lost()
+		return roundOver() or not coinAlive(coin)
 	end
-	if nearThreat(pos, threats, CFG.dangerRadius) then parkAtSafe() return end
-	parkAt(Vector3.new(pos.X, gy + 3, pos.Z))
+	local function settle()
+		if coinAlive(coin) then return "aborted" end
+		-- it vanished as we reached it, so it was ours; otherwise someone else took it
+		return (ctrl.pos - pos).Magnitude <= 6 and "collected" or "gone"
+	end
+
+	if state.mode == "dive" then
+		if not moveTo(Vector3.new(pos.X, diveY(floorY or pos.Y), pos.Z), lost) then return settle() end
+	end
+	if not moveTo(pos, lost) then return settle() end
+
+	touch(coin)
+	local start, nudge = os.clock(), 0
+	while ctrl.engaged and os.clock() - start < CFG.touchTime do
+		if not coinAlive(coin) then return "collected" end
+		if roundOver() or not (state.running and stillOwner()) then return "aborted" end
+		local due = math.floor((os.clock() - start) / 0.2)
+		if due > nudge and due <= #NUDGES then
+			nudge = due
+			ctrl.target = pos + NUDGES[nudge]
+		end
+		RunService.Heartbeat:Wait()
+	end
+	if not coinAlive(coin) then return "collected" end
+	return ctrl.engaged and "missed" or "aborted"
+end
+
+local function pickCoin(coins, from)
+	local best, bestPos, bestCost
+	for _, coin in ipairs(coins) do
+		local pos = coinPos(coin)
+		if pos then
+			local lp = toLocal(pos)
+			if not seenCoin[coin] then
+				seenCoin[coin] = true
+				Memory.spawned(state.mem, lp)
+			end
+			local cost = (pos - from).Magnitude * Memory.penalty(state.mem, lp)
+			if not bestCost or cost < bestCost then
+				best, bestPos, bestCost = coin, pos, cost
+			end
+		end
+	end
+	return best, bestPos
+end
+
+-- No coins right now: wait where they usually spawn (hidden under the map in dive mode).
+local function waitForCoins(cc)
+	if not ctrl.engaged then return end -- still standing at the spawn
+	local target
+	local spot = Memory.hotspot(state.mem, toLocal(ctrl.pos))
+	if spot then
+		spot = toWorld(spot)
+		local floorY = floorBelow(spot)
+		if floorY then state.safeSpot = Vector3.new(spot.X, floorY + 3, spot.Z) end
+		target = state.mode == "dive" and Vector3.new(spot.X, diveY(floorY or spot.Y), spot.Z) or spot
+	elseif state.mode == "dive" and state.safeSpot then
+		target = Vector3.new(ctrl.pos.X, diveY(state.safeSpot.Y - 3), ctrl.pos.Z)
+	end
+	if target and (target - ctrl.pos).Magnitude > 3 then
+		local nextCheck = 0
+		moveTo(target, function()
+			if roundOver() then return true end
+			if os.clock() < nextCheck then return false end
+			nextCheck = os.clock() + 0.3
+			return #listCoins(cc) > 0
+		end)
+	end
+end
+
+local function sitOut(reason)
+	state.roundDone = reason
+	setPhase(reason)
+	if state.mode == "dive" and ctrl.engaged and state.safeSpot then
+		-- stay hidden under the map until the round ends
+		moveTo(Vector3.new(ctrl.pos.X, diveY(state.safeSpot.Y - 3), ctrl.pos.Z), roundOver)
+	else
+		parkAndRelease(false)
+	end
 end
 
 ---------------------------------------------------------------------------
--- Round lifecycle
+-- Rounds
 ---------------------------------------------------------------------------
-local function finishRound()
-	if state.roundRecorded or not state.roundMap then return end
-	state.roundRecorded = true
-	Memory.noteRound(state.roundMap, state.roundCollected)
+local function startRound(map, hrp)
+	state.map = map
+	local ok, pivot = pcall(function() return map:GetPivot() end)
+	state.pivot = ok and pivot or nil
+	state.mem = Memory.map(map.Name)
+	state.roundDone = nil
+	state.roundCoins = 0
+	state.misses = 0
+	state.safeSpot = hrp.Position
+	state.cooldownUntil = 0
+	ctrl.diedAt = nil
+	ctrl.displaced = false -- the teleport into/out of a round isn't a reason to wait
+	table.clear(retryAt)
+	clearTraps(map)
+	print(string.format("[MM2] раунд на карте %s (в памяти раундов: %d)", map.Name, state.mem.rounds))
 end
 
-local function beginRound(cc, mapName)
-	if state.roundContainer ~= cc then
-		state.roundContainer = cc
-		state.roundMapName = mapName
-		state.roundMap = Memory.map(mapName)
-		state.roundCollected = 0
-		state.roundStart = os.clock()
-		state.roundRecorded = false
-		state.methodSwitched = false
-		state.bagFull = false
-		state.bagCount = state.bagMax and 0 or nil
-		state.activeMode = state.mode == "auto" and Memory.pickMode(state.roundMap) or state.mode
-		print(string.format("[MM2] новый раунд: %s, режим %s", mapName, state.activeMode))
+local function endRound()
+	if state.mem then
+		Memory.roundEnded(state.mem, state.roundCoins)
+		Memory.save(true)
 	end
-	state.inRound = true
-	state.roundStartSignal = false
-	state.roundEndSignal = false
-	state.failures = 0
-	state.emptySince = nil
-	state.lastSafe = nil
-	state.parked = false
-	setNoclip(true)
-	setFrozen(true)
-	setPhase("farming")
-end
-
-local function endRound(timeUp)
-	parkAtSafe()
-	resetCharacter()
-	finishRound()
-	state.inRound = false
-	state.roundOver = timeUp == true
-	state.endedContainer = state.roundContainer
-	state.bagFull = false
-	state.parked = false
-	state.lastSafe = nil
-	setPhase("round_end")
-end
-
-local function handleDeath()
-	if state.deathHandled then return end
-	state.deathHandled = true
-	if state.inRound and state.roundMap and state.lastPos then
-		Memory.noteDeath(state.roundMap, state.lastPos, state.activeMode)
-	end
-	finishRound()
-	-- dead players can't collect; wait for the next map instead of re-entering this one
-	if state.inRound then
-		state.roundOver = true
-		state.endedContainer = state.roundContainer
-	end
-	state.inRound = false
-	state.lastSafe = nil
-	state.parked = false
-	state.bagFull = false
-	state.failures = 0
-	state.frozen = false
-	state.noclip = false
-	state.tweening = false
-	table.clear(partCollide)
-end
-
-track(LocalPlayer.CharacterAdded:Connect(function()
-	if state.inRound then handleDeath() end
-	state.deathHandled = false
-	state.frozen = false
-	state.noclip = false
-	table.clear(partCollide)
-end))
-
-local function switchHold()
-	state.holdMethod = state.holdMethod == "anchor" and "hover" or "anchor"
-	state.methodSwitched = true
-	state.failures = 0
-	if state.frozen then setFrozen(true) end
-	print("[MM2] метод удержания → " .. state.holdMethod)
+	state.map, state.pivot, state.mem = nil, nil, nil
+	state.roundDone = nil
+	state.misses = 0
 end
 
 local function farmStep()
 	if game.PlaceId ~= PLACE_ID then
-		resetCharacter()
+		release()
 		setPhase("wrong_game")
-		return 1
+		return 2
 	end
 
 	local char, hum, hrp = getChar()
-	if not char or not hum or not hrp or hum.Health <= 0 then
-		if state.inRound then handleDeath() end
-		setPhase("dead")
+	if not char then
+		if state.map and not state.roundDone then
+			if ctrl.diedAt then Memory.died(state.mem, toLocal(ctrl.diedAt)) end
+			state.roundDone = "dead"
+		end
+		release()
+		setPhase(state.map and "dead" or "waiting")
 		return 0.5
 	end
-	state.lastPos = hrp.Position
 
-	local cc, mapName = pickContainer(hrp)
-	local secs = roundSeconds()
-	state.roundSeconds = secs
-
-	if not cc then
-		state.mapEmpty = true
-		if state.inRound then endRound(false) end
-		state.roundOver = false
-		state.roundEndSignal = false
+	local map, cc = findMap()
+	local alive = LocalPlayer:GetAttribute("Alive")
+	local onMap = map ~= nil and alive ~= false and (ctrl.engaged or nearMap(map, hrp.Position))
+	if not onMap then
+		if state.map then
+			parkAndRelease(true)
+			endRound()
+		else
+			release()
+		end
 		setPhase("waiting")
-		return 0.4
-	end
-
-	if state.roundOver then
-		-- MM2 loads a fresh map per round, so a new container instance means a new round
-		if cc == state.endedContainer and not state.roundStartSignal then
-			state.roundEndSignal = false
-			setPhase("round_end")
-			return 0.5
-		end
-		state.roundOver = false
-	end
-	state.mapEmpty = false
-
-	if not state.inRound then
-		state.roundEndSignal = false
-		beginRound(cc, mapName)
-	end
-	local m = state.roundMap
-
-	if state.roundEndSignal or (secs and secs <= CFG.endBuffer) then
-		state.roundEndSignal = false
-		endRound(true)
 		return 0.5
 	end
 
-	if state.bagFull then
-		if not state.parked then
-			state.parked = true
-			parkAtSafe()
-		end
-		setPhase("bagfull")
-		return 0.4
+	if state.map ~= map then
+		if state.map then endRound() end
+		startRound(map, hrp)
+	end
+	if state.roundDone then
+		setPhase(state.roundDone)
+		return 0.5
 	end
 
-	-- without the game's bag signal, fall back to a fixed or learned cap
-	local cap = (CFG.bagCap > 0 and CFG.bagCap) or (not state.bagMax and Memory.bagCap()) or nil
-	if cap and state.roundCollected >= cap then
-		state.bagFull = true
-		setPhase("bagfull")
-		return 0.4
+	if ctrl.displaced then
+		-- the game moved us; give it a moment before taking control again
+		ctrl.displaced = false
+		state.cooldownUntil = os.clock() + 1.5
+	end
+	if os.clock() < state.cooldownUntil then return 0.2 end
+
+	if bagIsFull() then
+		sitOut("bag_full")
+		return 0.5
 	end
 
-	local containers = { cc }
-	local params = makeRayParams(containers)
-	local mode = state.activeMode
-	local threats = (CFG.avoidMurderer and mode == "normal") and murdererPositions() or {}
-
-	-- murderer closing in: drop under the map until they leave
-	if #threats > 0 and nearThreat(hrp.Position, threats, CFG.dangerRadius) then
-		local gy = groundY(hrp.Position, params)
-		parkAt(Vector3.new(hrp.Position.X, gy - CFG.diveDepth, hrp.Position.Z))
-		state.parked = false
-		setPhase("threat")
-		return 0.25
-	end
-
-	local coins = listCoins(containers)
-	state.coinsOnMap = #coins
-
+	local coins = listCoins(cc)
 	if #coins == 0 then
-		state.emptySince = state.emptySince or os.clock()
-		if os.clock() - state.emptySince > CFG.emptyWait then
-			if not state.parked then
-				state.parked = true
-				parkAtHotspot(hrp, params, threats)
-			end
-			setPhase("no_coins")
-		end
-		return 0.2
+		setPhase("no_coins")
+		waitForCoins(cc)
+		return 0.3
 	end
-	state.emptySince = nil
-	state.parked = false
 
-	local coin, info = chooseCoin(coins, hrp.Position, m, mode, threats, params)
-	if not coin then
-		setPhase("threat")
-		return 0.25
-	end
+	local coin, pos = pickCoin(coins, ctrl.engaged and ctrl.pos or hrp.Position)
+	if not coin then return 0.3 end
+	local floorY = floorBelow(pos)
+	if floorY then state.safeSpot = Vector3.new(pos.X, floorY + 3, pos.Z) end
+	if not engage(char, hum, hrp) then return 0.5 end
 	setPhase("farming")
-	state.lastSafe = Vector3.new(info.pos.X, info.gy + 3, info.pos.Z)
 
-	local t0 = os.clock()
-	local result = collectCoin(coin, info, cc, mode)
-	if result ~= "aborted" then
-		Memory.noteMode(m, mode, result == "collected" and 1 or 0, os.clock() - t0)
-	end
-
-	-- Failures only say something about the spot/method when the bag is known not to be full.
-	local bagKnownOpen = state.bagMax ~= nil and (state.bagCount or 0) < state.bagMax
-
+	local result = collect(coin, pos, floorY)
 	if result == "collected" then
-		state.roundCollected += 1
-		state.totalCollected += 1
-		state.failures = 0
-		Memory.noteResult(m, info.pos, true)
-		Memory.noteHold(state.holdMethod, true)
-		if state.totalCollected % 10 == 0 then
-			print(string.format("[MM2] всего %d (раунд %d)", state.totalCollected, state.roundCollected))
+		state.roundCoins += 1
+		state.totalCoins += 1
+		state.misses = 0
+		Memory.result(state.mem, toLocal(pos), true)
+		if state.totalCoins % 10 == 0 then
+			print(string.format("[MM2] всего %d (раунд %d)", state.totalCoins, state.roundCoins))
 		end
-		return 0.01
-	elseif result == "gone" then
-		state.failures = 0
-		return 0.01
-	elseif result == "failed" then
-		if bagKnownOpen then
-			Memory.noteResult(m, info.pos, false)
-			Memory.noteHold(state.holdMethod, false)
-		end
-		blacklist[coin] = os.clock() + CFG.blacklistTime * (1 + math.min(Memory.failCount(m, info.pos), 3))
-		state.failures += 1
-		if state.failures >= CFG.failLimit then
-			if not state.methodSwitched then
-				-- try the other hold method before assuming the bag is full
-				switchHold()
-			elseif bagKnownOpen then
-				state.failures = 0
-			else
-				state.bagFull = true
-				setPhase("bagfull")
-			end
-		end
-		return 0.02
+	elseif result == "missed" then
+		retryAt[coin] = os.clock() + CFG.retryAfter
+		state.misses += 1
+		local known, _, anyFull = bagUI()
+		if known and not anyFull then Memory.result(state.mem, toLocal(pos), false) end
 	end
-	return 0.05
+	return 0
 end
 
 local function farmLoop()
-	while state.running and stillOwner() do
-		local ok, delay = pcall(farmStep)
-		if ok then
-			state.lastError = nil
-			task.wait(delay or 0.01)
+	while stillOwner() do
+		if state.running then
+			local ok, delay = pcall(farmStep)
+			if ok then
+				state.lastError = nil
+				task.wait(delay)
+			else
+				state.lastError = tostring(delay)
+				setPhase("error")
+				warn("[MM2] " .. state.lastError)
+				pcall(parkAndRelease, false)
+				task.wait(1)
+			end
 		else
-			state.lastError = tostring(delay)
-			setPhase("error")
-			resetCharacter()
-			state.inRound = false
-			task.wait(0.6)
+			if ctrl.engaged then pcall(parkAndRelease, false) end
+			setPhase("off")
+			task.wait(0.25)
 		end
 	end
-	-- a newer instance owns the character now; don't undo its setup
-	if stillOwner() then resetCharacter() end
-end
-
-local function giveToWindow(obj)
-	if window and type(window.Give) == "function" then
-		pcall(function() window:Give(obj) end)
-	end
-end
-
-local function startFarm()
-	if state.running then return end
-	state.running = true
-	state.inRound = false
-	state.roundOver = false
-	state.bagFull = false
-	state.failures = 0
-	state.emptySince = nil
-	state.lastSafe = nil
-	state.parked = false
-	setPhase("waiting")
-	if not state.thread or coroutine.status(state.thread) == "dead" then
-		state.thread = task.spawn(farmLoop)
-		giveToWindow(state.thread)
-	end
-end
-
-local function stopFarm()
-	state.running = false
-	setPhase("stopped")
-	resetCharacter()
-	Memory.save(true)
 end
 
 ---------------------------------------------------------------------------
 -- UI
 ---------------------------------------------------------------------------
-local MODE_LABEL = { normal = "обычный", dive = "выныривание", auto = "авто" }
+local tab = window:Tab({ Title = "Фарм" })
+local section = tab:Section({ Title = "Автофарм" })
 
-window = UI:CreateWindow({
-	Id = "mm2-collect",
-	Title = "MM2 Collect",
-	Subtitle = "coins · память карт",
+section:Toggle({
+	Id = "enabled",
+	Text = "Автофарм",
+	Description = "Собирает монеты каждый раунд. Выключение возвращает управление персонажу.",
+	Default = true,
+	Callback = function(on)
+		state.running = on
+	end,
 })
 
-local farmTab = window:Tab({ Title = "Фарм" })
-
-local control = farmTab:Section({ Title = "Управление" })
-
-control:Segmented({
+section:Segmented({
 	Id = "mode",
 	Text = "Режим",
-	Description = "Обычный — над картой. Выныривание — под картой, подъём вертикально. Авто — выбирает лучший режим для карты по памяти.",
-	Options = { "Обычный", "Выныривание", "Авто" },
+	Description = "Обычный — летит прямо к монете. Выныривание — идёт под картой и поднимается к монете снизу.",
+	Options = { "Обычный", "Выныривание" },
 	Default = "Обычный",
 	Callback = function(value)
-		local mode = (value == "Выныривание" and "dive") or (value == "Авто" and "auto") or "normal"
-		state.mode = mode
-		if mode ~= "auto" then
-			state.activeMode = mode
-		elseif state.roundMap then
-			state.activeMode = Memory.pickMode(state.roundMap)
-		end
+		state.mode = value == "Выныривание" and "dive" or "normal"
 	end,
 })
 
-control:Toggle({
-	Id = "enabled",
-	Text = "Запуск",
-	Description = "Выключение сразу возвращает управление персонажу.",
-	Default = true,
-	Callback = function(enabled)
-		if enabled then startFarm() else stopFarm() end
-	end,
-})
-
-control:Toggle({
-	Id = "avoid",
-	Text = "Избегать убийцу",
-	Description = "В обычном режиме пропускает монеты рядом с убийцей и уходит под карту при его приближении.",
-	Default = CFG.avoidMurderer,
-	Callback = function(on)
-		CFG.avoidMurderer = on
-	end,
-})
-
-local settingsSection = farmTab:Section({ Title = "Настройки" })
-
-settingsSection:Slider({
-	Id = "speed",
-	Text = "Скорость",
-	Min = 10,
-	Max = 60,
-	Step = 1,
-	Default = CFG.speed,
-	Suffix = " studs/s",
-	Callback = function(value)
-		CFG.speed = value
-	end,
-})
-
-settingsSection:Slider({
-	Id = "depth",
-	Text = "Глубина",
-	Min = 8,
-	Max = 60,
-	Step = 1,
-	Default = CFG.diveDepth,
-	Suffix = " studs",
-	Callback = function(value)
-		CFG.diveDepth = value
-	end,
-})
-
-local stats = farmTab:Section({ Title = "Статистика" })
-
-local stateLabel = stats:Label({ Text = "Состояние: ждём раунд" })
-local roundLabel = stats:Label({ Text = "За раунд: 0" })
-local totalLabel = stats:Label({ Text = "За сессию: 0" })
-local rateLabel = stats:Label({ Text = "Темп: —" })
-local mapLabel = stats:Label({ Text = "На карте: 0" })
-local timerLabel = stats:Label({ Text = "Таймер: —" })
-local bagLabel = stats:Label({ Text = "Мешок: не полон" })
-
-local memSection = farmTab:Section({ Title = "Память" })
-
-memSection:Toggle({
-	Id = "learning",
-	Text = "Обучение",
-	Description = "Запоминать точки появления монет, высоту земли, опасные зоны и эффективность режимов.",
-	Default = CFG.learning,
-	Callback = function(on)
-		CFG.learning = on
-	end,
-})
-
-if type(memSection.Button) == "function" then
-	memSection:Button({
-		Text = "Забыть текущую карту",
-		Callback = function()
-			Memory.forget(state.roundMapName)
-			state.roundMap = state.roundMapName and Memory.map(state.roundMapName) or nil
-			Memory.save(true)
-		end,
-	})
-end
-
-local memLabel = memSection:Label({ Text = "Память: —" })
-local mapInfoLabel = memSection:Label({ Text = "Карта: —" })
-local bestModeLabel = memSection:Label({ Text = "Режимы: —" })
-local holdLabel = memSection:Label({ Text = "Удержание: " .. state.holdMethod })
-
-local checks = farmTab:Section({ Title = "Проверки" })
-local gameLabel = checks:Label({ Text = "Игра: проверка…" })
-local modeLabel = checks:Label({ Text = "Режим: обычный" })
-local signalLabel = checks:Label({ Text = "Сигналы игры: —" })
-local errorLabel = checks:Label({ Text = "Ошибок нет" })
-
-local function formatTimer(secs)
-	if not secs then return "—" end
-	return string.format("%dm %02ds", math.floor(secs / 60), secs % 60)
-end
-
-local function formatRate(rate)
-	if not rate then return "—" end
-	return string.format("%.0f/ч", rate * 3600)
-end
+local statusLabel = section:Label({ Text = "Статус: —" })
+local memoryLabel = section:Label({ Text = "Память: —" })
 
 local function updateUI()
-	stateLabel:SetText("Состояние: " .. (PHASE_TEXT[state.phase] or state.phase))
-	roundLabel:SetText("За раунд: " .. tostring(state.roundCollected))
-	totalLabel:SetText("За сессию: " .. tostring(state.totalCollected))
-	local elapsed = os.clock() - state.sessionStart
-	rateLabel:SetText("Темп: " .. (elapsed > 30 and formatRate(state.totalCollected / elapsed) or "—"))
-	mapLabel:SetText("На карте: " .. tostring(state.coinsOnMap))
-	timerLabel:SetText("Таймер: " .. formatTimer(state.roundSeconds))
-	if state.bagMax then
-		bagLabel:SetText(string.format("Мешок: %d/%d%s", state.bagCount or 0, state.bagMax, state.bagFull and " (полон)" or ""))
+	local text = PHASE_TEXT[state.phase] or state.phase
+	if state.phase == "error" and state.lastError then text = text .. ": " .. state.lastError end
+	statusLabel:SetText(string.format("Статус: %s · за раунд %d · всего %d", text, state.roundCoins, state.totalCoins))
+	local m = state.mem
+	if m and state.map then
+		memoryLabel:SetText(string.format("Память: %s — %d раундов, ~%d монет за раунд",
+			state.map.Name, m.rounds, math.floor((m.avg or 0) + 0.5)))
 	else
-		bagLabel:SetText("Мешок: " .. (state.bagFull and "полон" or "не полон"))
-	end
-
-	local maps, cells, sessions = Memory.summary()
-	memLabel:SetText(string.format("Память: %d карт, %d точек, сессия #%d%s", maps, cells, sessions,
-		Memory.persistent() and "" or " (без файла)"))
-	local m = state.roundMap
-	if m then
-		mapInfoLabel:SetText(string.format("Карта: %s · раундов %d · ~%.0f монет · смертей %d",
-			state.roundMapName or "?", m.rounds, m.coinsEma or 0, m.deaths))
-		bestModeLabel:SetText(string.format("Режимы: обычный %s · выныривание %s",
-			formatRate(Memory.modeRate(m, "normal")), formatRate(Memory.modeRate(m, "dive"))))
-	else
-		mapInfoLabel:SetText("Карта: —")
-		bestModeLabel:SetText("Режимы: —")
-	end
-	holdLabel:SetText("Удержание: " .. state.holdMethod)
-
-	local modeText = MODE_LABEL[state.mode] or state.mode
-	if state.mode == "auto" then modeText ..= " → " .. (MODE_LABEL[state.activeMode] or state.activeMode) end
-	modeLabel:SetText("Режим: " .. modeText)
-	signalLabel:SetText("Сигналы игры: " .. (state.coinSignalSeen and "монеты ок" or (state.coinRemoteHooked and "ждём первую монету" or "нет, эвристика")))
-	if game.PlaceId == PLACE_ID then
-		gameLabel:SetText("Игра: ок")
-	else
-		gameLabel:SetText("Игра: не та (" .. tostring(game.PlaceId) .. ")")
-	end
-	if state.lastError then
-		errorLabel:SetText("Ошибка: " .. tostring(state.lastError))
-	else
-		errorLabel:SetText("Ошибок нет")
+		local maps, spots = Memory.stats()
+		memoryLabel:SetText(string.format("Память: %d карт, %d точек%s", maps, spots,
+			Memory.persistent and "" or " (без сохранения)"))
 	end
 end
 
-local uiThread = task.spawn(function()
+-- Older versions of this script anchored the root part; undo leftovers once.
+do
+	local _, hum, hrp = getChar()
+	if hrp and hrp.Anchored then pcall(function() hrp.Anchored = false end) end
+	if hum and hum.PlatformStand then pcall(function() hum.PlatformStand = false end) end
+end
+
+for _, conn in ipairs(connections) do giveToWindow(conn) end
+giveToWindow(task.spawn(farmLoop))
+giveToWindow(task.spawn(function()
 	while stillOwner() do
 		pcall(updateUI)
 		pcall(Memory.save, false)
-		task.wait(0.35)
+		task.wait(0.4)
 	end
-	pcall(Memory.save, true)
-	disconnectAll()
-end)
-giveToWindow(uiThread)
+end))
 
 if type(window.OnDestroy) == "function" then
 	window:OnDestroy(function()
-		if stillOwner() then stopFarm() else state.running = false end
-		disconnectAll()
-		if ENV and ENV.MM2_TOKEN == TOKEN then
-			ENV.MM2_TOKEN = nil
+		state.running = false
+		if ctrl.engaged and state.safeSpot and ctrl.pos.Y < state.safeSpot.Y - 5 then
+			-- the controller is gone with the window, so hop straight out from under the map
+			pcall(function() ctrl.hrp.CFrame = CFrame.new(state.safeSpot) * ctrl.rot end)
 		end
+		release()
+		pcall(Memory.save, true)
+		if ENV and ENV.MM2_TOKEN == TOKEN then ENV.MM2_TOKEN = nil end
 	end)
 end
 
-updateUI()
-startFarm()
-
-return "ready (mode=" .. state.mode .. ", running=" .. tostring(state.running) .. ", memory=" .. tostring(Memory.persistent()) .. ")"
+return "ready (memory=" .. tostring(Memory.persistent) .. ")"
