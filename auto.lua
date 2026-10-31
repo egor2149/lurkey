@@ -27,6 +27,18 @@ do
 	if ok and type(env) == "table" then ENV = env end
 end
 
+do
+	if ENV and ENV.MM2_ANTIAFK then pcall(function() ENV.MM2_ANTIAFK:Disconnect() end) end
+	local VirtualUser = game:GetService("VirtualUser")
+	local conn = LocalPlayer.Idled:Connect(function()
+		pcall(function()
+			VirtualUser:CaptureController()
+			VirtualUser:ClickButton2(Vector2.new())
+		end)
+	end)
+	if ENV then ENV.MM2_ANTIAFK = conn end
+end
+
 local stopAntiFling
 do
 	local parts = setmetatable({}, { __mode = "k" })
@@ -382,6 +394,7 @@ local function engage(char, hum, hrp)
 	end
 	local _, yaw = hrp.CFrame:ToOrientation()
 	ctrl.engaged = true
+	if ENV then ENV.MM2_HOLDER = TOKEN end
 	ctrl.char, ctrl.hum, ctrl.hrp = char, hum, hrp
 	ctrl.pos, ctrl.target = hrp.Position, nil
 	ctrl.rot = CFrame.Angles(0, yaw, 0)
@@ -424,8 +437,8 @@ connections[#connections + 1] = RunService.Heartbeat:Connect(function(dt)
 	end
 	if (hrp.Position - ctrl.pos).Magnitude > 12 then
 		ctrl.displaced = true
-		release()
-		return
+		ctrl.pos = hrp.Position
+		ctrl.target = nil
 	end
 	local target = ctrl.target
 	if target then
@@ -682,7 +695,7 @@ end
 local function moveTo(target, abort)
 	if not ctrl.engaged then return false end
 	ctrl.target = target
-	while ctrl.engaged do
+	while ctrl.engaged and ctrl.target == target do
 		if (ctrl.pos - target).Magnitude < 0.05 then return true end
 		if not stillOwner() or not (state.running or state.parking) then break end
 		if abort and abort() then break end
@@ -692,21 +705,26 @@ local function moveTo(target, abort)
 	return false
 end
 
-local function parkAndRelease(waitForTeleport)
+local function park(waitForTeleport)
 	local spot = state.safeSpot
-	if ctrl.engaged and spot then
-		if waitForTeleport and ctrl.pos.Y < spot.Y - 8 then
-			local deadline = os.clock() + 4
-			while ctrl.engaged and stillOwner() and os.clock() < deadline do
-				RunService.Heartbeat:Wait()
-			end
+	if not ctrl.engaged or not spot or ctrl.pos.Y >= spot.Y - 5 then return end
+	ctrl.displaced = false
+	if waitForTeleport then
+		local deadline = os.clock() + 4
+		while ctrl.engaged and not ctrl.displaced and stillOwner() and os.clock() < deadline do
+			RunService.Heartbeat:Wait()
 		end
-		if ctrl.engaged then
-			state.parking = true
-			moveTo(spot)
-			state.parking = false
-		end
+		if ctrl.displaced then return end
 	end
+	if ctrl.engaged then
+		state.parking = true
+		moveTo(spot)
+		state.parking = false
+	end
+end
+
+local function parkAndRelease()
+	park(false)
 	release()
 end
 
@@ -883,15 +901,19 @@ local function waitForCoins(cc)
 	end
 end
 
-local function sitOut(reason)
-	state.roundDone = reason
-	setPhase(reason)
+local function resetCharacter()
+	state.resetAt = os.clock()
+	local _, hum = getChar()
+	if not hum then return end
+	pcall(function() hum:ChangeState(Enum.HumanoidStateType.Dead) end)
+	pcall(function() hum.Health = 0 end)
+end
+
+local function bagFull()
+	state.roundDone = "bag_full"
+	setPhase("bag_full")
 	setFarming(false)
-	if state.mode == "dive" and ctrl.engaged and state.safeSpot then
-		moveTo(Vector3.new(ctrl.pos.X, diveY(state.safeSpot.Y - 3), ctrl.pos.Z), roundOver)
-	else
-		parkAndRelease(false)
-	end
+	resetCharacter()
 end
 
 local function startRound(map, hrp)
@@ -949,19 +971,17 @@ local function farmStep()
 		return 0.5
 	end
 
+	holdStill(char, hum, hrp)
+
 	local map, cc = findMap()
 	local alive = LocalPlayer:GetAttribute("Alive")
-	local onMap = map ~= nil and alive ~= false and ((ctrl.engaged and state.map == map) or nearMap(map, hrp.Position))
+	local onMap = map ~= nil and alive ~= false and nearMap(map, hrp.Position)
 	if not onMap then
 		if state.map then
-			parkAndRelease(true)
+			park(true)
 			endRound()
-		elseif ctrl.displaced then
-			ctrl.displaced = false
-			state.cooldownUntil = os.clock() + 1
-		elseif os.clock() >= state.cooldownUntil then
-			holdStill(char, hum, hrp)
 		end
+		ctrl.displaced = false
 		setPhase("waiting")
 		return 0.5
 	end
@@ -971,6 +991,7 @@ local function farmStep()
 		startRound(map, hrp)
 	end
 	if state.roundDone then
+		if state.roundDone == "bag_full" and os.clock() - (state.resetAt or 0) > 3 then resetCharacter() end
 		setPhase(state.roundDone)
 		return 0.5
 	end
@@ -982,7 +1003,7 @@ local function farmStep()
 	if os.clock() < state.cooldownUntil then return 0.2 end
 
 	if bagIsFull() then
-		sitOut("bag_full")
+		bagFull()
 		return 0.5
 	end
 
@@ -1029,13 +1050,13 @@ local function farmLoop()
 				setPhase("error")
 				setFarming(false)
 				warn("[MM2] " .. state.lastError)
-				pcall(parkAndRelease, false)
+				pcall(park, false)
 				task.wait(1)
 			end
 		else
 			setPhase("off")
 			setFarming(false)
-			if ctrl.engaged then pcall(parkAndRelease, false) end
+			if ctrl.engaged then pcall(parkAndRelease) end
 			task.wait(0.25)
 		end
 	end
@@ -1055,6 +1076,18 @@ window:Segmented({
 	Default = "Normal",
 	Callback = function(value)
 		state.mode = value == "Dive" and "dive" or "normal"
+	end,
+})
+
+local function setRendering(enabled)
+	pcall(function() RunService:Set3dRenderingEnabled(enabled) end)
+end
+
+window:Toggle({
+	Text = "Disable rendering",
+	Default = false,
+	Callback = function(off)
+		setRendering(not off)
 	end,
 })
 
@@ -1078,10 +1111,18 @@ local function updateUI()
 end
 
 do
-	local _, hum, hrp = getChar()
+	local _, _, hrp = getChar()
 	if hrp and hrp.Anchored then pcall(function() hrp.Anchored = false end) end
-	if hum and hum.PlatformStand then pcall(function() hum.PlatformStand = false end) end
 end
+
+connections[#connections + 1] = LocalPlayer.CharacterAdded:Connect(function(char)
+	if not state.running or not stillOwner() or game.PlaceId ~= PLACE_ID then return end
+	local hrp = char:WaitForChild("HumanoidRootPart", 5)
+	local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 5)
+	if hrp and hum and hum.Health > 0 and state.running and LocalPlayer.Character == char then
+		holdStill(char, hum, hrp)
+	end
+end)
 
 for _, conn in ipairs(connections) do giveToWindow(conn) end
 giveToWindow(task.spawn(function()
@@ -1108,6 +1149,7 @@ end))
 window:OnDestroy(function()
 	state.running = false
 	setFarming(false)
+	setRendering(true)
 	stopAntiFling()
 	local spot = state.safeSpot
 	if ctrl.engaged and spot and ctrl.pos.Y < spot.Y - 5 then
@@ -1125,8 +1167,22 @@ window:OnDestroy(function()
 				hrp.CFrame = CFrame.new(ctrl.pos) * ctrl.rot
 				if ctrl.pos == spot then break end
 			end
-			release()
+			local successor = ENV and ENV.MM2_TOKEN ~= nil and ENV.MM2_TOKEN ~= TOKEN
 			if ENV and ENV.MM2_SURFACING == surfacing then ENV.MM2_SURFACING = nil end
+			if successor then
+				local deadline = os.clock() + 2
+				while ENV.MM2_HOLDER == TOKEN and hrp.Parent and hum.Health > 0 and os.clock() < deadline do
+					hrp.AssemblyLinearVelocity = Vector3.zero
+					hrp.AssemblyAngularVelocity = Vector3.zero
+					hrp.CFrame = CFrame.new(ctrl.pos) * ctrl.rot
+					RunService.Heartbeat:Wait()
+				end
+				if ENV.MM2_HOLDER ~= TOKEN then
+					ctrl.engaged = false
+					return
+				end
+			end
+			release()
 		end)
 	else
 		release()
