@@ -96,28 +96,255 @@ do
 	end
 end
 
-local UI_URL = "https://raw.githubusercontent.com/Project-Ptolemy/ProjectUAI/main/dist/uai-ui.lua"
-local UI
+---------------------------------------------------------------------------
+-- Built-in UI: one draggable window with a toggle, a segmented selector and
+-- text rows. No external code is downloaded.
+---------------------------------------------------------------------------
+local UI = {}
 do
-	local loader = loadstring or load
-	if type(loader) ~= "function" then
-		error("executor missing loadstring")
+	local UserInputService = game:GetService("UserInputService")
+	local TweenService = game:GetService("TweenService")
+	local CoreGui = game:GetService("CoreGui")
+	local GUI_NAME = "MM2CollectUI"
+
+	local C = {
+		bg = Color3.fromRGB(24, 24, 28),
+		header = Color3.fromRGB(32, 32, 38),
+		row = Color3.fromRGB(34, 34, 40),
+		track = Color3.fromRGB(58, 58, 66),
+		accent = Color3.fromRGB(255, 184, 48),
+		text = Color3.fromRGB(235, 235, 240),
+		muted = Color3.fromRGB(150, 150, 160),
+		onAccent = Color3.fromRGB(28, 22, 8),
+	}
+	local FONT, FONT_BOLD = Enum.Font.Gotham, Enum.Font.GothamBold
+	local WIDTH, PAD, ROW = 320, 10, 36
+
+	local function make(class, props, parent)
+		local inst = Instance.new(class)
+		for k, v in pairs(props) do inst[k] = v end
+		inst.Parent = parent
+		return inst
 	end
-	local ok, result = pcall(function()
-		return loader(game:HttpGet(UI_URL))()
-	end)
-	if not ok or type(result) ~= "table" then
-		error("UI lib failed: " .. tostring(result))
+	local function corner(parent, radius)
+		make("UICorner", { CornerRadius = UDim.new(0, radius or 6) }, parent)
 	end
-	UI = result
+	local function text(parent, props)
+		local base = {
+			BackgroundTransparency = 1, Font = FONT, TextSize = 14, TextColor3 = C.text,
+			TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true, Text = "",
+		}
+		for k, v in pairs(props) do base[k] = v end
+		return make("TextLabel", base, parent)
+	end
+	local function tween(inst, props, t)
+		TweenService:Create(inst, TweenInfo.new(t or 0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+	end
+	local function guiParent()
+		local ok, gui = pcall(function()
+			if type(gethui) == "function" then return gethui() end
+			return CoreGui
+		end)
+		if ok and gui then return gui end
+		return LocalPlayer:WaitForChild("PlayerGui")
+	end
+
+	local Window = {}
+	Window.__index = Window
+
+	function UI.CreateWindow(opts)
+		local parent = guiParent()
+		local old = parent:FindFirstChild(GUI_NAME)
+		if old then old:Destroy() end -- fires the previous instance's cleanup through Destroying
+
+		local self = setmetatable({ resources = {}, alive = true, rows = 0 }, Window)
+		local gui = make("ScreenGui", { Name = GUI_NAME, ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+			DisplayOrder = 999 }, nil)
+		pcall(function() gui.IgnoreGuiInset = true end)
+		self.gui = gui
+
+		local frame = make("Frame", { Name = "Window", BackgroundColor3 = C.bg, BorderSizePixel = 0,
+			Position = UDim2.new(0, 24, 0.5, -140), Size = UDim2.fromOffset(WIDTH, 100), Active = true }, gui)
+		corner(frame, 10)
+		make("UIStroke", { Color = Color3.fromRGB(60, 60, 70), Thickness = 1 }, frame)
+		self.frame = frame
+
+		local header = make("Frame", { Name = "Header", BackgroundColor3 = C.header, BorderSizePixel = 0,
+			Size = UDim2.new(1, 0, 0, 40) }, frame)
+		corner(header, 10)
+		make("Frame", { BackgroundColor3 = C.header, BorderSizePixel = 0, Position = UDim2.new(0, 0, 1, -10),
+			Size = UDim2.new(1, 0, 0, 10) }, header)
+		text(header, { Text = opts.Title or "", Font = FONT_BOLD, TextSize = 15, Position = UDim2.fromOffset(PAD + 2, 4),
+			Size = UDim2.new(1, -120, 0, 20) })
+		text(header, { Text = opts.Subtitle or "", TextSize = 12, TextColor3 = C.muted, Position = UDim2.fromOffset(PAD + 2, 22),
+			Size = UDim2.new(1, -120, 0, 14) })
+		local hint = text(header, { Text = "", TextSize = 11, TextColor3 = C.muted, TextXAlignment = Enum.TextXAlignment.Right,
+			Position = UDim2.new(1, -96, 0, 0), Size = UDim2.fromOffset(60, 40) })
+		local close = make("TextButton", { Text = "×", Font = FONT_BOLD, TextSize = 20, TextColor3 = C.muted,
+			BackgroundTransparency = 1, Position = UDim2.new(1, -34, 0, 6), Size = UDim2.fromOffset(28, 28), AutoButtonColor = false }, header)
+		close.MouseEnter:Connect(function() close.TextColor3 = C.text end)
+		close.MouseLeave:Connect(function() close.TextColor3 = C.muted end)
+		close.Activated:Connect(function() self:Destroy() end)
+
+		local body = make("Frame", { Name = "Body", BackgroundTransparency = 1, Position = UDim2.fromOffset(PAD, 48),
+			Size = UDim2.new(1, -PAD * 2, 1, -56) }, frame)
+		make("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, body)
+		self.body = body
+
+		-- dragging by the header, mouse and touch
+		local dragStart, frameStart
+		header.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragStart, frameStart = input.Position, frame.Position
+			end
+		end)
+		header.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragStart = nil
+			end
+		end)
+		self:Give(UserInputService.InputChanged:Connect(function(input)
+			if dragStart and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+				local d = input.Position - dragStart
+				frame.Position = UDim2.new(frameStart.X.Scale, frameStart.X.Offset + d.X, frameStart.Y.Scale, frameStart.Y.Offset + d.Y)
+			end
+		end))
+
+		-- show/hide key
+		local key = opts.ToggleKey
+		if key then
+			hint.Text = key.Name
+			self:Give(UserInputService.InputBegan:Connect(function(input, processed)
+				if not processed and input.KeyCode == key then frame.Visible = not frame.Visible end
+			end))
+		end
+
+		gui.Destroying:Connect(function() self:Destroy() end)
+		gui.Parent = parent
+		self:_Resize()
+		return self
+	end
+
+	function Window:_Resize()
+		local h = 48 + self.rows * (ROW + 6) + 8
+		self.frame.Size = UDim2.fromOffset(WIDTH, h)
+	end
+
+	function Window:_Row(height)
+		self.rows += 1
+		local row = make("Frame", { BackgroundColor3 = C.row, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, height or ROW),
+			LayoutOrder = self.rows }, self.body)
+		corner(row, 6)
+		self:_Resize()
+		return row
+	end
+
+	function Window:Toggle(opts)
+		local row = self:_Row()
+		text(row, { Text = opts.Text or "", Position = UDim2.fromOffset(PAD, 0), Size = UDim2.new(1, -80, 1, 0) })
+		local track = make("TextButton", { Text = "", BackgroundColor3 = C.track, AutoButtonColor = false,
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -PAD, 0.5, 0), Size = UDim2.fromOffset(44, 24) }, row)
+		corner(track, 12)
+		local knob = make("Frame", { BackgroundColor3 = C.text, Position = UDim2.fromOffset(3, 3), Size = UDim2.fromOffset(18, 18) }, track)
+		corner(knob, 9)
+		local value = opts.Default == true
+		local function render(animate)
+			local t = animate and 0.15 or 0
+			tween(track, { BackgroundColor3 = value and C.accent or C.track }, t)
+			tween(knob, { Position = UDim2.fromOffset(value and 23 or 3, 3), BackgroundColor3 = value and C.onAccent or C.text }, t)
+		end
+		local control = {}
+		function control:Set(v, silent)
+			v = v == true
+			if v == value then return end
+			value = v
+			render(true)
+			if not silent and opts.Callback then task.spawn(opts.Callback, value) end
+		end
+		function control:Get() return value end
+		track.Activated:Connect(function() control:Set(not value) end)
+		render(false)
+		return control
+	end
+
+	function Window:Segmented(opts)
+		local row = self:_Row()
+		text(row, { Text = opts.Text or "", Position = UDim2.fromOffset(PAD, 0), Size = UDim2.new(0, 90, 1, 0) })
+		local options = opts.Options or {}
+		local holder = make("Frame", { BackgroundColor3 = C.track, AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -PAD, 0.5, 0), Size = UDim2.new(1, -(PAD * 2 + 90), 0, 26) }, row)
+		corner(holder, 6)
+		local buttons = {}
+		local value = opts.Default or options[1]
+		local n = #options
+		local function render()
+			for i, b in ipairs(buttons) do
+				local on = options[i] == value
+				tween(b, { BackgroundColor3 = on and C.accent or C.track, TextColor3 = on and C.onAccent or C.muted })
+			end
+		end
+		local control = {}
+		function control:Set(v, silent)
+			if v == value then return end
+			value = v
+			render()
+			if not silent and opts.Callback then task.spawn(opts.Callback, value) end
+		end
+		function control:Get() return value end
+		for i, option in ipairs(options) do
+			local b = make("TextButton", { Text = option, Font = FONT, TextSize = 13, TextColor3 = C.muted, AutoButtonColor = false,
+				BackgroundColor3 = C.track, Position = UDim2.new((i - 1) / n, 2, 0, 2), Size = UDim2.new(1 / n, -4, 1, -4), BorderSizePixel = 0 }, holder)
+			corner(b, 5)
+			b.Activated:Connect(function() control:Set(option) end)
+			buttons[i] = b
+		end
+		render()
+		return control
+	end
+
+	function Window:Label(opts)
+		local row = self:_Row()
+		local label = text(row, { Text = opts.Text or "", TextSize = 13, Position = UDim2.fromOffset(PAD, 0), Size = UDim2.new(1, -PAD * 2, 1, 0) })
+		local control = {}
+		function control:SetText(t)
+			if label.Text ~= t then label.Text = t end
+		end
+		return control
+	end
+
+	-- Resources (connections, threads, functions) released when the window closes.
+	function Window:Give(resource)
+		if not self.alive then
+			self:_Dispose(resource)
+			return
+		end
+		self.resources[#self.resources + 1] = resource
+	end
+	function Window:OnDestroy(fn) self:Give(fn) end
+	function Window:_Dispose(r)
+		local kind = typeof(r)
+		if kind == "function" then r()
+		elseif kind == "RBXScriptConnection" then r:Disconnect()
+		elseif kind == "thread" then task.cancel(r)
+		elseif kind == "Instance" then r:Destroy()
+		end
+	end
+	function Window:Destroy()
+		if not self.alive then return end
+		self.alive = false
+		local list = self.resources
+		self.resources = {}
+		for i = #list, 1, -1 do pcall(self._Dispose, self, list[i]) end
+		if self.gui.Parent then self.gui:Destroy() end
+	end
 end
 
--- Creating the window destroys a previous instance's window (same Id), which
--- lets that instance hand the character back before we claim ownership.
-local window = UI:CreateWindow({
-	Id = "mm2-collect",
+-- Creating the window destroys a previous instance's window, which runs that
+-- instance's cleanup before we claim the character.
+local window = UI.CreateWindow({
 	Title = "MM2 Collect",
 	Subtitle = "автофарм монет",
+	ToggleKey = Enum.KeyCode.RightShift,
 })
 
 local TOKEN = {}
@@ -128,9 +355,7 @@ local function stillOwner()
 end
 
 local function giveToWindow(resource)
-	if type(window.Give) == "function" then
-		pcall(function() window:Give(resource) end)
-	end
+	window:Give(resource)
 end
 
 ---------------------------------------------------------------------------
@@ -1011,23 +1236,16 @@ end
 ---------------------------------------------------------------------------
 -- UI
 ---------------------------------------------------------------------------
-local tab = window:Tab({ Title = "Фарм" })
-local section = tab:Section({ Title = "Автофарм" })
-
-section:Toggle({
-	Id = "enabled",
+window:Toggle({
 	Text = "Автофарм",
-	Description = "Собирает монеты каждый раунд. Выключение возвращает управление персонажу.",
 	Default = true,
 	Callback = function(on)
 		state.running = on
 	end,
 })
 
-section:Segmented({
-	Id = "mode",
+window:Segmented({
 	Text = "Режим",
-	Description = "Обычный — летит прямо к монете. Выныривание — идёт под картой и поднимается к монете снизу.",
 	Options = { "Обычный", "Выныривание" },
 	Default = "Обычный",
 	Callback = function(value)
@@ -1035,8 +1253,8 @@ section:Segmented({
 	end,
 })
 
-local statusLabel = section:Label({ Text = "Статус: —" })
-local memoryLabel = section:Label({ Text = "Память: —" })
+local statusLabel = window:Label({ Text = "Статус: —" })
+local memoryLabel = window:Label({ Text = "Память: —" })
 
 local function updateUI()
 	local text = PHASE_TEXT[state.phase] or state.phase
@@ -1083,7 +1301,7 @@ giveToWindow(task.spawn(function()
 	end
 end))
 
-if type(window.OnDestroy) == "function" then
+do
 	window:OnDestroy(function()
 		state.running = false
 		stopAntiFling()
