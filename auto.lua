@@ -27,6 +27,18 @@ do
 	if ok and type(env) == "table" then ENV = env end
 end
 
+do
+	if ENV and ENV.MM2_ANTIAFK then pcall(function() ENV.MM2_ANTIAFK:Disconnect() end) end
+	local VirtualUser = game:GetService("VirtualUser")
+	local conn = LocalPlayer.Idled:Connect(function()
+		pcall(function()
+			VirtualUser:CaptureController()
+			VirtualUser:ClickButton2(Vector2.new())
+		end)
+	end)
+	if ENV then ENV.MM2_ANTIAFK = conn end
+end
+
 local stopAntiFling
 do
 	local parts = setmetatable({}, { __mode = "k" })
@@ -424,8 +436,8 @@ connections[#connections + 1] = RunService.Heartbeat:Connect(function(dt)
 	end
 	if (hrp.Position - ctrl.pos).Magnitude > 12 then
 		ctrl.displaced = true
-		release()
-		return
+		ctrl.pos = hrp.Position
+		ctrl.target = nil
 	end
 	local target = ctrl.target
 	if target then
@@ -682,7 +694,7 @@ end
 local function moveTo(target, abort)
 	if not ctrl.engaged then return false end
 	ctrl.target = target
-	while ctrl.engaged do
+	while ctrl.engaged and ctrl.target == target do
 		if (ctrl.pos - target).Magnitude < 0.05 then return true end
 		if not stillOwner() or not (state.running or state.parking) then break end
 		if abort and abort() then break end
@@ -692,21 +704,26 @@ local function moveTo(target, abort)
 	return false
 end
 
-local function parkAndRelease(waitForTeleport)
+local function park(waitForTeleport)
 	local spot = state.safeSpot
-	if ctrl.engaged and spot then
-		if waitForTeleport and ctrl.pos.Y < spot.Y - 8 then
-			local deadline = os.clock() + 4
-			while ctrl.engaged and stillOwner() and os.clock() < deadline do
-				RunService.Heartbeat:Wait()
-			end
+	if not ctrl.engaged or not spot or ctrl.pos.Y >= spot.Y - 5 then return end
+	ctrl.displaced = false
+	if waitForTeleport then
+		local deadline = os.clock() + 4
+		while ctrl.engaged and not ctrl.displaced and stillOwner() and os.clock() < deadline do
+			RunService.Heartbeat:Wait()
 		end
-		if ctrl.engaged then
-			state.parking = true
-			moveTo(spot)
-			state.parking = false
-		end
+		if ctrl.displaced then return end
 	end
+	if ctrl.engaged then
+		state.parking = true
+		moveTo(spot)
+		state.parking = false
+	end
+end
+
+local function parkAndRelease()
+	park(false)
 	release()
 end
 
@@ -883,15 +900,19 @@ local function waitForCoins(cc)
 	end
 end
 
-local function sitOut(reason)
-	state.roundDone = reason
-	setPhase(reason)
+local function resetCharacter()
+	state.resetAt = os.clock()
+	local _, hum = getChar()
+	if not hum then return end
+	pcall(function() hum:ChangeState(Enum.HumanoidStateType.Dead) end)
+	pcall(function() hum.Health = 0 end)
+end
+
+local function bagFull()
+	state.roundDone = "bag_full"
+	setPhase("bag_full")
 	setFarming(false)
-	if state.mode == "dive" and ctrl.engaged and state.safeSpot then
-		moveTo(Vector3.new(ctrl.pos.X, diveY(state.safeSpot.Y - 3), ctrl.pos.Z), roundOver)
-	else
-		parkAndRelease(false)
-	end
+	resetCharacter()
 end
 
 local function startRound(map, hrp)
@@ -949,19 +970,17 @@ local function farmStep()
 		return 0.5
 	end
 
+	holdStill(char, hum, hrp)
+
 	local map, cc = findMap()
 	local alive = LocalPlayer:GetAttribute("Alive")
-	local onMap = map ~= nil and alive ~= false and ((ctrl.engaged and state.map == map) or nearMap(map, hrp.Position))
+	local onMap = map ~= nil and alive ~= false and nearMap(map, hrp.Position)
 	if not onMap then
 		if state.map then
-			parkAndRelease(true)
+			park(true)
 			endRound()
-		elseif ctrl.displaced then
-			ctrl.displaced = false
-			state.cooldownUntil = os.clock() + 1
-		elseif os.clock() >= state.cooldownUntil then
-			holdStill(char, hum, hrp)
 		end
+		ctrl.displaced = false
 		setPhase("waiting")
 		return 0.5
 	end
@@ -971,6 +990,7 @@ local function farmStep()
 		startRound(map, hrp)
 	end
 	if state.roundDone then
+		if state.roundDone == "bag_full" and os.clock() - (state.resetAt or 0) > 3 then resetCharacter() end
 		setPhase(state.roundDone)
 		return 0.5
 	end
@@ -982,7 +1002,7 @@ local function farmStep()
 	if os.clock() < state.cooldownUntil then return 0.2 end
 
 	if bagIsFull() then
-		sitOut("bag_full")
+		bagFull()
 		return 0.5
 	end
 
@@ -1029,13 +1049,13 @@ local function farmLoop()
 				setPhase("error")
 				setFarming(false)
 				warn("[MM2] " .. state.lastError)
-				pcall(parkAndRelease, false)
+				pcall(park, false)
 				task.wait(1)
 			end
 		else
 			setPhase("off")
 			setFarming(false)
-			if ctrl.engaged then pcall(parkAndRelease, false) end
+			if ctrl.engaged then pcall(parkAndRelease) end
 			task.wait(0.25)
 		end
 	end
@@ -1055,6 +1075,18 @@ window:Segmented({
 	Default = "Normal",
 	Callback = function(value)
 		state.mode = value == "Dive" and "dive" or "normal"
+	end,
+})
+
+local function setRendering(enabled)
+	pcall(function() RunService:Set3dRenderingEnabled(enabled) end)
+end
+
+window:Toggle({
+	Text = "Disable rendering",
+	Default = false,
+	Callback = function(off)
+		setRendering(not off)
 	end,
 })
 
@@ -1108,6 +1140,7 @@ end))
 window:OnDestroy(function()
 	state.running = false
 	setFarming(false)
+	setRendering(true)
 	stopAntiFling()
 	local spot = state.safeSpot
 	if ctrl.engaged and spot and ctrl.pos.Y < spot.Y - 5 then
