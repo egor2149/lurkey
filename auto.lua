@@ -7,15 +7,94 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = Players.LocalPlayer
 local PLACE_ID = 142823291
+local MAX_SPEED = 25 -- studs/s; hard cap for every scripted move
 
 local CFG = {
-	speed = 23, -- studs/s
+	speed = MAX_SPEED, -- studs/s, clamped to MAX_SPEED
 	diveDepth = 25, -- studs under the floor in dive mode
 	touchTime = 1, -- seconds to wait on a coin for the server to register it
 	retryAfter = 20, -- seconds before a missed coin is tried again
 	missLimit = 4, -- consecutive misses treated as a full bag when bag counts are unavailable
 	mapMargin = 60, -- studs outside the map bounds that still count as "on the map"
 }
+
+local ENV
+do
+	local ok, env = pcall(function() return getgenv() end)
+	if ok and type(env) == "table" then ENV = env end
+end
+
+---------------------------------------------------------------------------
+-- Antifling, always on and silent. Same idea as Infinite Yield's antifling
+-- (other characters never collide with us), but parts are cached per
+-- character instead of rescanning every character on every step. A velocity
+-- guard also cancels spin/launch that still reaches our root part.
+---------------------------------------------------------------------------
+local stopAntiFling
+do
+	local parts = setmetatable({}, { __mode = "k" })
+	local charConns = setmetatable({}, { __mode = "k" })
+	local conns = {}
+	local MAX_SPIN, MAX_PUSH = 40, 90 -- rad/s, horizontal studs/s; walking is 16
+
+	local function addPart(part)
+		if part:IsA("BasePart") then parts[part] = true end
+	end
+	local function removePart(part)
+		parts[part] = nil
+	end
+	local function watchCharacter(char)
+		if charConns[char] then return end
+		for _, d in ipairs(char:GetDescendants()) do addPart(d) end
+		charConns[char] = {
+			char.DescendantAdded:Connect(addPart),
+			char.DescendantRemoving:Connect(removePart),
+		}
+	end
+	local function unwatchCharacter(char)
+		for _, c in ipairs(charConns[char] or {}) do c:Disconnect() end
+		charConns[char] = nil
+		for part in pairs(parts) do
+			if not part.Parent or part:IsDescendantOf(char) then parts[part] = nil end
+		end
+	end
+	local function watchPlayer(player)
+		if player == LocalPlayer then return end
+		if player.Character then watchCharacter(player.Character) end
+		conns[#conns + 1] = player.CharacterAdded:Connect(watchCharacter)
+		conns[#conns + 1] = player.CharacterRemoving:Connect(unwatchCharacter)
+	end
+
+	for _, player in ipairs(Players:GetPlayers()) do watchPlayer(player) end
+	conns[#conns + 1] = Players.PlayerAdded:Connect(watchPlayer)
+	-- humanoids turn collisions back on, so this has to run every step
+	conns[#conns + 1] = RunService.Stepped:Connect(function()
+		for part in pairs(parts) do
+			if part.CanCollide then part.CanCollide = false end
+		end
+	end)
+	conns[#conns + 1] = RunService.Heartbeat:Connect(function()
+		local char = LocalPlayer.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		if not root or root.Anchored then return end
+		local v = root.AssemblyLinearVelocity
+		if root.AssemblyAngularVelocity.Magnitude > MAX_SPIN or Vector3.new(v.X, 0, v.Z).Magnitude > MAX_PUSH then
+			root.AssemblyAngularVelocity = Vector3.zero
+			root.AssemblyLinearVelocity = Vector3.new(0, math.min(v.Y, 0), 0)
+		end
+	end)
+
+	function stopAntiFling()
+		for _, c in ipairs(conns) do c:Disconnect() end
+		table.clear(conns)
+		for char in pairs(charConns) do unwatchCharacter(char) end
+		if ENV and ENV.MM2_ANTIFLING == stopAntiFling then ENV.MM2_ANTIFLING = nil end
+	end
+	if ENV then
+		if type(ENV.MM2_ANTIFLING) == "function" then pcall(ENV.MM2_ANTIFLING) end
+		ENV.MM2_ANTIFLING = stopAntiFling
+	end
+end
 
 local UI_URL = "https://raw.githubusercontent.com/Project-Ptolemy/ProjectUAI/main/dist/uai-ui.lua"
 local UI
@@ -41,11 +120,6 @@ local window = UI:CreateWindow({
 	Subtitle = "автофарм монет",
 })
 
-local ENV
-do
-	local ok, env = pcall(function() return getgenv() end)
-	if ok and type(env) == "table" then ENV = env end
-end
 local TOKEN = {}
 if ENV then ENV.MM2_TOKEN = TOKEN end
 
@@ -315,6 +389,7 @@ end
 
 local function engage(char, hum, hrp)
 	if not stillOwner() then return false end
+	if ENV and ENV.MM2_SURFACING then return false end -- the previous instance is still flying us out
 	if ctrl.engaged then
 		if ctrl.hrp == hrp then return true end
 		release()
@@ -371,7 +446,7 @@ connections[#connections + 1] = RunService.Heartbeat:Connect(function(dt)
 	local target = ctrl.target
 	if target then
 		local delta = target - ctrl.pos
-		local step = CFG.speed * math.min(dt, 0.1)
+		local step = math.min(CFG.speed, MAX_SPEED) * math.min(dt, 0.1)
 		ctrl.pos = delta.Magnitude <= step and target or ctrl.pos + delta.Unit * step
 	end
 	hrp.AssemblyLinearVelocity = Vector3.zero
@@ -656,10 +731,80 @@ local NUDGES = {
 	Vector3.zero,
 }
 
-local function collect(coin, pos, floorY)
+local coinFloor = setmetatable({}, { __mode = "k" })
+local function floorOf(coin, pos)
+	local y = coinFloor[coin]
+	if y == nil then
+		y = floorBelow(pos) or false
+		coinFloor[coin] = y
+	end
+	return y or nil
+end
+
+local function rivals()
+	local list = {}
+	for _, player in ipairs(Players:GetPlayers()) do
+		local char = player ~= LocalPlayer and player.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if root and hum and hum.Health > 0 then list[#list + 1] = root.Position end
+	end
+	return list
+end
+
+-- Path length for the current mode (dive goes under the coin, then straight up).
+local function travel(from, pos, floorY)
+	if state.mode == "dive" then
+		local under = Vector3.new(pos.X, diveY(floorY or pos.Y), pos.Z)
+		return (under - from).Magnitude + (pos - under).Magnitude
+	end
+	return (pos - from).Magnitude
+end
+
+local RIVAL_SPEED = 16 -- default MM2 walk speed
+local function score(coin, pos, from, others)
+	local dist = travel(from, pos, floorOf(coin, pos))
+	local cost = dist * Memory.penalty(state.mem, toLocal(pos))
+	local eta = dist / math.min(CFG.speed, MAX_SPEED)
+	for _, other in ipairs(others) do
+		local d = (other - pos).Magnitude
+		if d < 20 and d / RIVAL_SPEED < eta then
+			return cost * 3 + 40 -- someone gets there first
+		end
+	end
+	return cost
+end
+
+-- Cheapest coin by travel cost (mode-aware path, learned penalties, rivals).
+local function pickCoin(coins, from, exclude)
+	local others = rivals()
+	local best, bestPos, bestCost
+	for _, coin in ipairs(coins) do
+		local pos = coin ~= exclude and coinPos(coin)
+		if pos then
+			if not seenCoin[coin] then
+				seenCoin[coin] = true
+				Memory.spawned(state.mem, toLocal(pos))
+			end
+			local cost = score(coin, pos, from, others)
+			if not bestCost or cost < bestCost then best, bestPos, bestCost = coin, pos, cost end
+		end
+	end
+	return best, bestPos, bestCost
+end
+
+local function collect(coin, pos, floorY, cc)
 	local events = Bag.events
+	local nextCheck = os.clock() + 0.3
 	local function lost()
-		return roundOver() or not coinAlive(coin)
+		if roundOver() or not coinAlive(coin) then return true end
+		if os.clock() < nextCheck then return false end
+		nextCheck = os.clock() + 0.3
+		-- switch when a coin became much cheaper (new spawn nearby, or a rival is closing in on ours)
+		local current = score(coin, pos, ctrl.pos, rivals())
+		if current < 8 then return false end
+		local _, _, alt = pickCoin(listCoins(cc), ctrl.pos, coin)
+		return alt ~= nil and alt < current * 0.6
 	end
 	local function settle()
 		if coinAlive(coin) then return "aborted" end
@@ -677,7 +822,7 @@ local function collect(coin, pos, floorY)
 	while ctrl.engaged and os.clock() - start < CFG.touchTime do
 		if not coinAlive(coin) then return confirmed(events, true) and "collected" or "gone" end
 		if roundOver() or not (state.running and stillOwner()) then return "aborted" end
-		local due = math.floor((os.clock() - start) / 0.2)
+		local due = math.floor((os.clock() - start) / 0.15)
 		if due > nudge and due <= #NUDGES then
 			nudge = due
 			ctrl.target = pos + NUDGES[nudge]
@@ -686,25 +831,6 @@ local function collect(coin, pos, floorY)
 	end
 	if not coinAlive(coin) then return confirmed(events, true) and "collected" or "gone" end
 	return ctrl.engaged and "missed" or "aborted"
-end
-
-local function pickCoin(coins, from)
-	local best, bestPos, bestCost
-	for _, coin in ipairs(coins) do
-		local pos = coinPos(coin)
-		if pos then
-			local lp = toLocal(pos)
-			if not seenCoin[coin] then
-				seenCoin[coin] = true
-				Memory.spawned(state.mem, lp)
-			end
-			local cost = (pos - from).Magnitude * Memory.penalty(state.mem, lp)
-			if not bestCost or cost < bestCost then
-				best, bestPos, bestCost = coin, pos, cost
-			end
-		end
-	end
-	return best, bestPos
 end
 
 -- No coins right now: wait where they usually spawn (hidden under the map in dive mode).
@@ -836,12 +962,12 @@ local function farmStep()
 
 	local coin, pos = pickCoin(coins, ctrl.engaged and ctrl.pos or hrp.Position)
 	if not coin then return 0.3 end
-	local floorY = floorBelow(pos)
+	local floorY = floorOf(coin, pos)
 	if floorY then state.safeSpot = Vector3.new(pos.X, floorY + 3, pos.Z) end
 	if not engage(char, hum, hrp) then return 0.5 end
 	setPhase("farming")
 
-	local result = collect(coin, pos, floorY)
+	local result = collect(coin, pos, floorY, cc)
 	if result == "collected" then
 		state.roundCoins += 1
 		state.totalCoins += 1
@@ -851,9 +977,10 @@ local function farmStep()
 			print(string.format("[MM2] всего %d (раунд %d)", state.totalCoins, state.roundCoins))
 		end
 	elseif result == "missed" then
-		retryAt[coin] = os.clock() + CFG.retryAfter
 		state.misses += 1
-		local known, _, anyFull = Bag.status()
+		local known, _, anyFull, exact = Bag.status()
+		-- server counts say there's room, so the coin itself is uncollectable (decoy): skip it this round
+		retryAt[coin] = (known and exact and not anyFull) and math.huge or os.clock() + CFG.retryAfter
 		if known and not anyFull then Memory.result(state.mem, toLocal(pos), false) end
 	end
 	return 0
@@ -959,11 +1086,31 @@ end))
 if type(window.OnDestroy) == "function" then
 	window:OnDestroy(function()
 		state.running = false
-		if ctrl.engaged and state.safeSpot and ctrl.pos.Y < state.safeSpot.Y - 5 then
-			-- the controller is gone with the window, so hop straight out from under the map
-			pcall(function() ctrl.hrp.CFrame = CFrame.new(state.safeSpot) * ctrl.rot end)
+		stopAntiFling()
+		local spot = state.safeSpot
+		if ctrl.engaged and spot and ctrl.pos.Y < spot.Y - 5 then
+			-- the window's controller is being torn down, so fly out from under the map
+			-- on a separate thread, still within the speed cap
+			local surfacing = {}
+			if ENV then ENV.MM2_SURFACING = surfacing end
+			task.spawn(function()
+				local hrp, hum = ctrl.hrp, ctrl.hum
+				while ctrl.engaged and hrp.Parent and hum.Health > 0 do
+					local dt = RunService.Heartbeat:Wait()
+					local delta = spot - ctrl.pos
+					local step = math.min(CFG.speed, MAX_SPEED) * math.min(dt, 0.1)
+					ctrl.pos = delta.Magnitude <= step and spot or ctrl.pos + delta.Unit * step
+					hrp.AssemblyLinearVelocity = Vector3.zero
+					hrp.AssemblyAngularVelocity = Vector3.zero
+					hrp.CFrame = CFrame.new(ctrl.pos) * ctrl.rot
+					if ctrl.pos == spot then break end
+				end
+				release()
+				if ENV and ENV.MM2_SURFACING == surfacing then ENV.MM2_SURFACING = nil end
+			end)
+		else
+			release()
 		end
-		release()
 		pcall(Memory.save, true)
 		if ENV and ENV.MM2_TOKEN == TOKEN then ENV.MM2_TOKEN = nil end
 	end)
